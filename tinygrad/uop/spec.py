@@ -74,8 +74,8 @@ movement_ops = PatternMatcher([
   (UPat((Ops.VECTORIZE, Ops.VCONST), dtype=dtypes.index), lambda: True),
   (UPat({Ops.ADD, Ops.MUL, Ops.IDIV}, dtype=dtypes.index), lambda: True),
 
-  # AFTER on Movement Op
-  (UPat(Ops.AFTER, src=(UPat(GroupOp.Movement.union({Ops.MULTI, Ops.CONTIGUOUS})),), allow_any_len=True), lambda: True),
+  # AFTER on Movement Op or ASSIGN
+  (UPat(Ops.AFTER, src=(UPat(GroupOp.Movement.union({Ops.MULTI, Ops.CONTIGUOUS, Ops.ASSIGN})),), allow_any_len=True), lambda: True),
 ])
 
 _tensor_spec = PatternMatcher([
@@ -260,7 +260,7 @@ full_spec = PatternMatcher([
   # PTRCAT is like VECTORIZE, but it functions on ptrs
   (UPat(Ops.PTRCAT, name="x"), lambda x: x.dtype.vcount == sum([y.dtype.base.count for y in x.src])),
   # CAT is like VECTORIZE, but the srcs can be vectors
-  (UPat(Ops.CAT, name="x"), lambda x: x.dtype.vcount == sum([y.dtype.vcount for y in x.src])),
+  (UPat(Ops.VCAT, name="x"), lambda x: x.dtype.vcount == sum([y.dtype.vcount for y in x.src])),
   # vectorized index
   (UPat(Ops.INDEX, src=(UPat((Ops.VECTORIZE, Ops.CAST)), UPat())), lambda: True),
 

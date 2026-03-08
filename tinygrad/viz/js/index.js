@@ -284,6 +284,7 @@ function setFocus(key) {
       const prgSrc = ctxs[i+1].steps.findIndex(s => s.name === "View Source");
       if (prgSrc !== -1) html.append("a").text("View Source").on("click", () => switchCtx(i, prgSrc));
     }
+    if (e.arg.trace != null) html.append(() => traceBlock(JSON.parse(e.arg.trace.replace("TB:", "")).slice(1).reverse()));
   }
   if (eventType === EventTypes.BUF) {
     const [dtype, sz, nbytes, dur] = e.arg.tooltipText.split("\n");
@@ -301,7 +302,8 @@ function setFocus(key) {
   }
   // instructions list renderer
   let instList = document.getElementById("insts");
-  if (data.pcToShape.size > 0 && instList == null) {
+  if (data.pcToShape.size == 0) return d3.select(instList?.parentElement).html("");
+  if (instList == null) {
     let contents = "", i = 0;
     for (const [k, v] of data.pcToShape) {
       contents += `<div class="line" data-k="${k}"><span class="left" id="inst-${k}"><span class="n">${i++}</span><span class="wave">${v.wave}</span>
@@ -313,7 +315,7 @@ function setFocus(key) {
   }
   d3.select(instList).selectAll("span").classed("highlight", false);
   const instLine = document.getElementById(`inst-${key}`); instLine?.classList.add("highlight");
-  if (instLine != null && instList != null) {
+  if (instLine != null) {
     const r = rect(instLine), c = rect(instList);
     if (Math.max(c.top-r.bottom, r.top-c.bottom)>=-30) instLine.scrollIntoView({ block:"center" });
   }
@@ -416,10 +418,10 @@ async function renderProfiler(path, unit, opts) {
         }
         // tiny device events go straight to the rewrite rule
         const key = k.startsWith("TINY") ? null : `${k}-${j}`;
-        const labelHTML = label.map(l=>`<span style="color:${l.color}">${l.st}</span>`).join("");
-        let info = e.info != null ? "\n"+e.info : "";
-        if (info.startsWith("\nPC:")) data.pcToShape.set(key, {wave:dnum, pc:parseInt(e.info.split(":")[1]), st:e.st}); info = "";
-        const arg = { tooltipText:labelHTML+" N:"+shapes.length+"\n"+formatTime(e.dur)+info, bufs:[], key, ctx:shapeRef?.ctx, step:shapeRef?.step };
+        let info = e.info != null ? "\n"+e.info : "", trace = null
+        if (info.startsWith("\nPC:")) { data.pcToShape.set(key, {wave:dnum, pc:parseInt(e.info.split(":")[1]), st:e.st}); info = ""; }
+        if (info.startsWith("\nTB:")) { trace = info; info = ""; }
+        const arg = { tooltipText:" N:"+shapes.length+"\n"+formatTime(e.dur)+info, label, trace, bufs:[], key, ctx:shapeRef?.ctx, step:shapeRef?.step };
         if (e.key != null) shapeMap.set(e.key, key);
         // offset y by depth
         shapes.push({x:e.st, y:levelHeight*depth, width:e.dur, height:levelHeight, arg, label:opts.hideLabels ? null : label, fillColor });
@@ -673,11 +675,13 @@ async function renderProfiler(path, unit, opts) {
   canvas.addEventListener("mousemove", e => {
     const foundRect = findRectAtPosition(e.clientX, e.clientY);
     if (foundRect?.tooltipText != null) {
-      const tooltip = document.getElementById("tooltip");
+      const tooltip = document.getElementById("tooltip"), nodes = [];
+      for (const l of foundRect.label||[]) { const s = document.createElement("span"); s.innerText = l.st; s.style.color = l.color; nodes.push(s); }
+      nodes.push(document.createTextNode(foundRect.tooltipText));
+      tooltip.replaceChildren(...nodes);
       tooltip.style.display = "block";
       tooltip.style.left = (e.pageX+10)+"px";
       tooltip.style.top = (e.pageY)+"px";
-      tooltip.innerHTML = foundRect.tooltipText;
     } else tooltip.style.display = "none";
   });
   canvas.addEventListener("mouseleave", () => document.getElementById("tooltip").style.display = "none");
@@ -723,6 +727,15 @@ function codeBlock(st, language, { loc, wrap }={}) {
   if (loc != null) ret.appendChild(pathLink(loc[0], loc[1]).style("margin-bottom", "4px").node());
   ret.appendChild(code);
   return ret;
+}
+function traceBlock(trace) {
+  const root = d3.create("pre").append("code").classed("hljs", true);
+  for (let i=trace.length-1; i>=0; i--) {
+    const [fp, lineno, fn, code] = trace[i];
+    root.append("div").style("margin-bottom", "2px").style("display","flex").text(fn+" ").append(() => pathLink(fp, lineno).node());
+    root.append("div").html(hljs.highlight(code, { language: "python" }).value).style("margin-bottom", "1ex");
+  }
+  return root.node().parentNode;
 }
 
 function toggleCls(prev, next, cls, value) {
@@ -859,8 +872,6 @@ async function main() {
   // ** center graph
   const { currentCtx, currentStep, currentRewrite, expandSteps } = state;
   if (currentCtx == -1) return;
-  // always have a new sidebar when view changes
-  metadata.innerHTML = "";
   const ctx = ctxs[currentCtx];
   const step = ctx.steps[currentStep];
   const ckey = step?.query;
@@ -892,12 +903,9 @@ async function main() {
       opts = {heightScale:0.5, hideLabels:true, levelKey:step.name.includes("PKTS") ? (e) => parseInt(e.name.split(" ")[1].split(":")[1]) : null, colorByName:ckey.includes("pkts")};
       return renderProfiler(ckey, "clk", opts);
     }
-    ret.metadata?.forEach(m => {
-      if (Array.isArray(m)) return metadata.appendChild(tabulate(m.map(({ label, value }) => {
-        return [label.trim(), typeof value === "string" ? value : formatUnit(value)];
-      })).node());
-      metadata.appendChild(codeBlock(m.src)).classList.add("full-height")
-    });
+    metadata.replaceChildren(...((ret.metadata ?? []).map((m) => {
+      return tabulate(m.map((e) => [e.label.trim(), typeof e.value === "string" ? e.value : formatUnit(e.value)])).node();
+    })));
     // graph render
     if (ret.data != null) {
       metadata.prepend(showGraph.label);
@@ -971,15 +979,7 @@ async function main() {
   metadata.innerHTML = "";
   if (ckey.includes("rewrites")) metadata.append(showIndexing.label, showCallSrc.label, showSink.label);
   if (step.code_line != null) metadata.appendChild(codeBlock(step.code_line, "python", { loc:step.loc, wrap:true }));
-  if (step.trace) {
-    const trace = d3.create("pre").append("code").classed("hljs", true);
-    for (let i=step.trace.length-1; i>=0; i--) {
-      const [fp, lineno, fn, code] = step.trace[i];
-      trace.append("div").style("margin-bottom", "2px").style("display","flex").text(fn+" ").append(() => pathLink(fp, lineno).node());
-      trace.append("div").html(hljs.highlight(code, { language: "python" }).value).style("margin-bottom", "1ex");
-      metadata.appendChild(trace.node().parentNode);
-    }
-  }
+  if (step.trace) metadata.appendChild(traceBlock(step.trace));
   if (data.uop != null) metadata.appendChild(codeBlock(data.uop, "python", { wrap:false })).classList.toggle("full-height", step.match_count === 0);
   // ** multi graph in one page
   if (!step.match_count) return;

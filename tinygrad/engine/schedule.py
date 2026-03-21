@@ -22,6 +22,7 @@ def create_schedule(sched_sink:UOp) -> UOp:
     for u in sched_sink.toposort(gate_kernel_sink):
       if u.op is not Ops.AFTER: continue
       k = u.src[1]
+      if k.op is Ops.STORE: continue  # skip unprocessed STORE+AFTER inside precompiled CALL bodies
       assert k.op in {Ops.CALL, Ops.END}, f"AFTER src[1] should be CALL or END, not {k.op}"
       in_degree.setdefault(k, 0)
       if k.op is Ops.END: assert k.src[0].op is Ops.CALL, f"END src[0] should be KERNEL, not {k.src[0].op}"
@@ -83,7 +84,9 @@ def linear_to_schedule(linear:UOp) -> list[ExecItem]:
   return schedule
 
 from tinygrad.engine.memory import memory_planner
+from tinygrad.engine.realize import capturing
 from tinygrad.schedule.rangeify import get_kernel_graph
+from tinygrad.helpers import CAPTURING
 from tinygrad.uop.ops import PatternMatcher, UPat
 
 def create_new_buffer(ctx:tuple[dict[UOp, UOp], tuple[UOp, ...]], b:UOp):
@@ -154,6 +157,11 @@ def complete_create_schedule_with_vars(big_sink:UOp) -> tuple[list[ExecItem], di
       val = b.src[1].arg
       if var_vals.get(nm, val) != val: raise RuntimeError(f"bind mismatch on {nm}, {var_vals[nm]} != {val}")
       var_vals[nm] = val
+
+  # jit captures this schedule, no need to execute.
+  if len(capturing) and CAPTURING:
+    capturing[0].add_linear(linear, var_vals)
+    return [], var_vals
 
   # convert LINEAR to ExecItems
   schedule: list[ExecItem] = linear_to_schedule(linear)

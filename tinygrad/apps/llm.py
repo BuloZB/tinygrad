@@ -84,7 +84,7 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
 
 class TransformerBlock:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, head_dim:int, rope_theta:float,
-               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0):
+               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, norm_topk_prob:bool=False):
     self.n_heads      = n_heads
     self.n_kv_heads   = n_kv_heads
     self.head_dim     = head_dim
@@ -107,6 +107,7 @@ class TransformerBlock:
 
     # --- feed-forward (MoE or dense) -------------------------------------
     if num_experts > 0:
+      self.norm_topk_prob = norm_topk_prob
       self.num_experts_per_tok = num_experts_per_tok
       self.ffn_gate_inp = nn.Linear(dim, num_experts, bias=False)  # router
       self.ffn_gate_exps = ExpertWeights(num_experts, dim, hidden_dim)
@@ -117,7 +118,7 @@ class TransformerBlock:
       self.ffn_up      = nn.Linear(dim, hidden_dim, bias=False)
       self.ffn_down    = nn.Linear(hidden_dim, dim, bias=False)
 
-  @function(precompile=bool(getenv("PRECOMPILE", 0)))
+  @function
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     x_norm = self.attn_norm(x)                       # (B,T,D)
     q, k, v = self.attn_q(x_norm), self.attn_k(x_norm), self.attn_v(x_norm)
@@ -129,15 +130,13 @@ class TransformerBlock:
     v = v.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
     if self.qk_norm == self.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
-    freqs_cis = precompute_freqs_cis(self.head_dim, self.max_context, self.rope_theta)[start_pos:start_pos+T]
-    q = apply_rope(q, freqs_cis)
-    k = apply_rope(k, freqs_cis)
+    q = apply_rope(q, self.freqs_cis[start_pos:start_pos+T])
+    k = apply_rope(k, self.freqs_cis[start_pos:start_pos+T])
 
-    # TODO: fix assign to behave like this
-    assigned_kv = self.cache_kv.uop.after(self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.assign(Tensor.stack(k, v).contiguous().uop))
-    tensor_assigned_kv = Tensor(assigned_kv, device=assigned_kv.device)
-    k = tensor_assigned_kv[0, :, :, 0:start_pos+T, :]
-    v = tensor_assigned_kv[1, :, :, 0:start_pos+T, :]
+    # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
+    assigned_kv = Tensor(self.cache_kv.uop.after(self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).uop)))
+    k = assigned_kv[0, :, :, 0:start_pos+T, :]
+    v = assigned_kv[1, :, :, 0:start_pos+T, :]
 
     #self.cache_kv[:, :, :, start_pos:start_pos+T, :].assign(Tensor.stack(k, v))
     #k = self.cache_kv[0, :, :, 0:start_pos+T, :]
@@ -151,12 +150,13 @@ class TransformerBlock:
     attn = self.attn_output(attn)
     return x + attn
 
-  @function(precompile=bool(getenv("PRECOMPILE", 0)))
+  @function
   def _feed_forward(self, h: Tensor) -> Tensor:
     h_norm = self.ffn_norm(h)
     if hasattr(self, 'ffn_gate_exps'):
       x = h_norm.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
       probs, sel = self.ffn_gate_inp(h_norm).softmax(-1).topk(self.num_experts_per_tok)  # (B, T, k) each
+      if self.norm_topk_prob: probs = probs / probs.sum(axis=-1, keepdim=True)
       x_down = self.ffn_down_exps(sel, self.ffn_gate_exps(sel, x).silu() * self.ffn_up_exps(sel, x))  # (B, T, k, D)
       return h + (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
     # TODO: remove the need for this contiguous
@@ -166,15 +166,18 @@ class TransformerBlock:
   def __call__(self, x: Tensor, start_pos: int|UOp):
     if not hasattr(self, "cache_kv"):
       # TODO: how is the dtype of this determined?
-      # NOTE: clone is used to promise the creation of a specific buffer
-      self.cache_kv = Tensor.zeros(2, x.shape[0], self.n_kv_heads, self.max_context, self.head_dim, device=x.device).clone()
-    return self._feed_forward(self._attention(x, start_pos)).contiguous()
+      self.cache_kv = Tensor.empty(2, x.shape[0], self.n_kv_heads, self.max_context, self.head_dim, device=x.device)
+      self.freqs_cis = precompute_freqs_cis(self.head_dim, self.max_context, self.rope_theta)
+    # we pass in the weights implicitly so we unpack the GGUF on the fly
+    @function(precompile=True, allow_implicit=True)
+    def _run(x:Tensor, start_pos:int|UOp): return self._feed_forward(self._attention(x, start_pos)).contiguous()
+    return _run(x, start_pos)
 
 class Transformer:
   def __init__(self, *, num_blocks, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, vocab_size, head_dim:int, rope_theta:float,
-               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0):
+               max_context:int=0, qk_norm:int=0, num_experts:int=0, num_experts_per_tok:int=0, norm_topk_prob:bool=False):
     self.blk = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, head_dim, rope_theta, max_context, qk_norm,
-                                 num_experts, num_experts_per_tok) for _ in range(num_blocks)]
+                                 num_experts, num_experts_per_tok, norm_topk_prob) for _ in range(num_blocks)]
     self.token_embd  = nn.Embedding(vocab_size, dim)
     self.output_norm = nn.RMSNorm(dim, norm_eps)
     self.output = nn.Linear(dim, vocab_size, bias=False)
@@ -185,7 +188,7 @@ class Transformer:
     self.rollout_jit = TinyJit(self.forward)
 
   def forward(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
-    x = self.token_embd(tokens)                           # (B, T, D)
+    x = self.token_embd(tokens).float()                   # (B, T, D)
     for block in self.blk: x = block(x, start_pos)
     # TODO: add temperature
     return self.output(self.output_norm(x))[:, -1, :].softmax(-1, dtype="float").argmax(-1, keepdim=True)
@@ -221,7 +224,8 @@ class Transformer:
                         head_dim=kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads),
                         rope_theta=kv[f'{arch}.rope.freq_base'], max_context=max_context,
                         qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
-                        num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0))
+                        num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0),
+                        norm_topk_prob=True if arch=='qwen3moe' else False)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:

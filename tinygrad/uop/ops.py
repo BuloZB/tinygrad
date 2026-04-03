@@ -450,7 +450,8 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
       return self.index(*[UOp.const(dtypes.weakint, x) if isinstance(x, int) else x for x in idx])
   def const_like(self, b:ConstLike):
     # constants can optionally have a DEVICE source
-    return UOp.const(self.dtype.base, b, device=self._device, shape=self._shape)
+    ret = UOp.const(self.dtype.base, b, device=self._device, shape=self.shard_shape if self.axis is not None else self._shape)
+    return ret.multi(self.axis) if self.axis is not None else ret
   def broadcast(self, count:int):
     assert self.dtype.vcount == 1
     if count == 1: return self
@@ -510,7 +511,7 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
     return UOp(Ops.RANGE, dtype=dtype, src=(sint_to_uop(end, dtype),)+src, arg=(axis_id, axis_type)+arg, **kwargs)
   @staticmethod
   def special(end:sint, name:str, dtype=dtypes.weakint): return UOp(Ops.SPECIAL, dtype=dtype, src=(sint_to_uop(end, dtype),), arg=name)
-  def r(self, op:Ops, axis:tuple[int, ...]):
+  def _rop(self, op:Ops, axis:tuple[int, ...]):
     axis = tuple(sorted([x for x in axis if resolve(self.shape[x] != 1)]))
     return UOp(Ops.REDUCE_AXIS, self.dtype, (self,), (op, axis)) if len(axis) else self
   @staticmethod
@@ -1334,8 +1335,8 @@ if TRACK_MATCH_STATS or PROFILE:
     os.environ[env_str] = "0"
     os.environ[f"{env_str}_DATA"] = data
     if not int(os.getenv("VIZ", "0")) and not int(os.getenv("PROFILE", "0")):
-      args = ['--kernels', getenv("VIZ_DATA", "")] if getenv("VIZ_DATA", "") else []
-      args += ['--profile', getenv("PROFILE_DATA", "")] if getenv("PROFILE_DATA", "") else []
+      args = ['--rewrites-path', getenv("VIZ_DATA", "")] if getenv("VIZ_DATA", "") else []
+      args += ['--profile-path', getenv("PROFILE_DATA", "")] if getenv("PROFILE_DATA", "") else []
       viz_path = pathlib.Path(__file__).resolve().parent.parent / "viz" / "serve.py"
       os.execv(sys.executable, [sys.executable, viz_path.as_posix()] + args)
 
@@ -1581,7 +1582,7 @@ pm_pyrender_extra = PatternMatcher([
     f"UOp.new_buffer({repr(d.arg)}, {x.size}, {x.dtype}, {u.arg})"),
   (UPat(Ops.COPY, src=(UPat(name="x"), UPat(Ops.DEVICE, name="d"))), lambda ctx,x,d: f"{ctx[x]}.copy_to_device({repr(d.arg)})"),
   (UPat(Ops.CUSTOM_FUNCTION, name="x"), lambda ctx,x: f"UOp(Ops.CUSTOM_FUNCTION, {x.dtype}, src={srcs(ctx, x.src)}, arg={x.arg!r})"),
-  (UPat(Ops.REDUCE_AXIS, name="r"), lambda ctx,r: f"{ctx[r.src[0]]}.r({r.arg[0]}, {r.arg[1]})"),
+  (UPat(Ops.REDUCE_AXIS, name="r"), lambda ctx,r: f"{ctx[r.src[0]]}._rop({r.arg[0]}, {r.arg[1]})"),
   # NOTE: range has srcs sometimes after control flow
   (UPat(Ops.RANGE, src=(UPat(Ops.CONST, name="c"),), allow_any_len=True, name="x"), lambda ctx,x,c:
     "UOp.range("+', '.join([str(c.arg)] + [repr(y) for y in x.arg])+

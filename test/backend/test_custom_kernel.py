@@ -189,7 +189,7 @@ class TestCustomKernel(unittest.TestCase):
     A = Tensor.randn(16, 16).contiguous()
     B = Tensor.empty(16)
     B = Tensor.custom_kernel(B, A, fxn=slice_sum_kernel)[0]
-    self.assertTrue(B.allclose(A.sum(1)))
+    self.assertTrue(B.allclose(A.sum(1)).item())
 
   def test_gemm(self):
     N = 16
@@ -299,8 +299,8 @@ class TestCustomKernel(unittest.TestCase):
     from tinygrad import function
     @function(precompile=True)
     def run(x:Tensor, w:Tensor) -> Tensor:
-      out = Tensor.invalid(*x.shape, dtype=x.dtype)
-      tmp = Tensor.invalid(*x.shape, dtype=x.dtype)
+      out = Tensor.invalids(*x.shape, dtype=x.dtype)
+      tmp = Tensor.invalids(*x.shape, dtype=x.dtype)
       out, tmp = Tensor.custom_kernel(out, tmp, x, w, fxn=custom_add_with_tmp)[:2]
       return out+tmp
 

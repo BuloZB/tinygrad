@@ -73,8 +73,11 @@ if __name__ == "__main__":
 
   A, B = Tensor.normal(M, K, std=1e-1, dtype=dtypes.float16).realize(), Tensor.normal(K, N, std=1e-1, dtype=dtypes.float16).realize()
   C = A.matmul(B)
-  sched = C.schedule()
-  si = sched[-1]
+  from tinygrad.uop.ops import Ops
+  linear, var_vals = C.linear_with_vars()
+  last_call = linear.src[-1]
+  ast = last_call.src[0]
+  bufs = [s.buffer for s in last_call.src[1:] if s.op is not Ops.BIND]
 
   src = compiled.asm["ptx"]
   # specify the shared memory here so we don't need to do it dynamically
@@ -88,7 +91,7 @@ if __name__ == "__main__":
   prg = ProgramSpec("matmul_kernel", src, device=Device.DEFAULT,
                 global_size=[M//BLOCK_SIZE_M, N//BLOCK_SIZE_N, 1], local_size=[32*compiled.metadata.num_warps, 1, 1],
                 mem_estimate=A.nbytes() + B.nbytes() + C.nbytes())
-  ei = ExecItem(si.ast, [x.ensure_allocated() for x in si.bufs], si.metadata, prg=CompiledRunner(prg))
+  ei = ExecItem(ast, [x.ensure_allocated() for x in bufs], last_call.arg.metadata, prg=CompiledRunner(prg))
   tflops = []
   for i in range(5):
     tm = ei.run(wait=True)
@@ -97,10 +100,10 @@ if __name__ == "__main__":
 
   # check correctness
   if getenv("VERIFY"):
-    from tinygrad.engine.realize import run_schedule
+    from tinygrad.engine.realize import run_linear
     triton_buf = np.frombuffer(si.bufs[0].as_memoryview(), np.float16).reshape(M,N)
     print(triton_buf)
-    run_schedule(sched)
+    run_linear(linear, var_vals)
     tinygrad_buf = np.frombuffer(si.bufs[0].as_memoryview(), np.float16).reshape(M,N)
     print(tinygrad_buf)
     np.testing.assert_allclose(triton_buf, tinygrad_buf)

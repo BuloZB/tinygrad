@@ -3,8 +3,7 @@ import gc, unittest, time
 from tinygrad import nn, dtypes, Device, Tensor
 from tinygrad.uop.ops import UOp, Ops, GroupOp, UPat, KernelInfo
 from tinygrad.helpers import DEBUG, GlobalCounters, Context
-from tinygrad.engine.realize import CompiledRunner, run_schedule, run_linear
-from tinygrad.schedule import linear_to_schedule
+from tinygrad.engine.realize import compile_linear, run_linear
 
 class KernelCountException(Exception): pass
 def check_schedule(t:Tensor|list[Tensor]|UOp, allowed:int, to_prerealize:list[Tensor]|None=None, filter_sink=True):
@@ -15,17 +14,17 @@ def check_schedule(t:Tensor|list[Tensor]|UOp, allowed:int, to_prerealize:list[Te
   else:
     assert isinstance(t, UOp), f"can't schedule {t}"
     linear, var_vals = Tensor(t).linear_with_vars()
-  # test lowering all the ExecItems
-  sched = linear_to_schedule(linear)
-  for si in sched: si.lower()
-  kernel_cnt = len([si for si in sched if isinstance(si.prg, CompiledRunner) or not filter_sink])
+  kernel_cnt = sum((len(call.device) if isinstance(call.device, tuple) else 1)
+                   for call in linear.src if call.src[0].op is Ops.SINK or not filter_sink)
   if kernel_cnt != allowed:
     print(f"SCHEDULE ISSUE, expecting {allowed} got {kernel_cnt}")
     if DEBUG >= 3:
-      for i,s in enumerate(sched):
+      for i,call in enumerate(linear.src):
         print("kernel", i+1)
-        print(s.ast)
+        print(call.src[0])
     raise KernelCountException(f"{kernel_cnt} != {allowed}")
+  # test compiling the linear
+  compile_linear(linear)
   return linear, var_vals
 
 def _realize_weights(m):
@@ -40,9 +39,9 @@ class TestBufferUOp(unittest.TestCase):
     # the device Buffer remains unallocated until it's we run the schedule
     self.assertFalse(buf.uop.buffer.is_allocated())
     add = buf+1
-    sched = add.schedule()
+    linear, var_vals = add.linear_with_vars()
     self.assertFalse(buf.uop.buffer.is_allocated())
-    run_schedule(sched)
+    run_linear(linear, var_vals)
     self.assertTrue(buf.uop.buffer.is_allocated())
 
   def test_buffer_has_unique_buffer(self):
@@ -88,7 +87,7 @@ class TestBufferUOp(unittest.TestCase):
     # unused variable should not appear in var_vals even when there's other work
     a = Tensor(UOp.variable("unused", 0, 10).bind(1))
     b = Tensor.empty(3) + 1
-    _, var_vals = Tensor.schedule_with_vars(a, b)
+    _, var_vals = Tensor.linear_with_vars(a, b)
     self.assertEqual(var_vals, {})
     self.assertIsNone(a.uop.base.realized)
 
@@ -209,8 +208,8 @@ class TestSchedule(unittest.TestCase):
     t = Tensor.zeros((3, 3)).contiguous().realize()
     v = t[1]  # view - is_realized but not has_buffer_identity
     assert v.uop.is_realized
-    sched, _ = Tensor.schedule_with_vars(v)
-    self.assertEqual(len(sched), 0)
+    linear, _ = Tensor.linear_with_vars(v)
+    self.assertEqual(len(linear.src), 0)
 
   # NOTE: because empty does not have a lowered ExecItem if realize is called on a childless empty, it never gets allocated.
   def test_childless_empty_never_allocates(self):

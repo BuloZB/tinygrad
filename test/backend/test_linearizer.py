@@ -6,7 +6,7 @@ from tinygrad.codegen.opt import Opt, OptOps
 from tinygrad.uop.ops import UOp, Ops, GroupOp, AxisType
 from tinygrad.device import Device, Buffer, is_dtype_supported
 from tinygrad.tensor import Tensor, _to_np_dtype
-from tinygrad.engine.realize import run_schedule, CompiledRunner, get_program
+from tinygrad.engine.realize import run_linear, CompiledRunner, get_program
 from tinygrad.helpers import Context, flatten, dedup, TC_SELECT, TC_OPT, DEV
 from tinygrad.dtype import DType, dtypes, PtrDType, AddrSpace
 from tinygrad.renderer.ptx import PTXRenderer
@@ -286,12 +286,11 @@ class TestLinearizer(unittest.TestCase):
     a = Tensor.ones(4, 4).contiguous().realize()
     b = a.shrink(((1, 2), None)).pad(((1, 2), None))
     a.assign(b.where(2, a))
-    sched = a.schedule()
-    assert len(sched) == 1
-    sched_copy = sched[:]
-    run_schedule(sched)
+    linear, var_vals = a.linear_with_vars()
+    assert len(linear.src) == 1
+    run_linear(linear, var_vals)
     np.testing.assert_equal(a.flatten().numpy(), [1.,1.,1.,1.,2.,2.,2.,2.,1.,1.,1.,1.,1.,1.,1.,1.])
-    program = get_program(replace_opts(sched_copy[-1].ast, []), renderer=Device[Device.DEFAULT].renderer)
+    program = get_program(replace_opts(linear.src[-1].src[0], []), renderer=Device[Device.DEFAULT].renderer)
     assert not any(u.op == Ops.WHERE for u in program.uops), "found where where where should be folded"
 
   def test_phi_simplification(self):
@@ -341,7 +340,7 @@ class TestLinearizer(unittest.TestCase):
     out = x.flip((0,1)).contiguous()
     ast = helper_linearizer_opt(out)
     store_val = [u.src[1] for u in get_program(ast, renderer=Device[Device.DEFAULT].renderer).uops if u.op is Ops.STORE][0]
-    assert store_val.dtype == dtypes.float.vec(4) and store_val.op is not Ops.VECTORIZE
+    assert store_val.dtype == dtypes.float.vec(4) and store_val.op is not Ops.STACK
 
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_local, "test requires locals")
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_shared, "test requires shared")
@@ -388,15 +387,18 @@ class TestLinearizer(unittest.TestCase):
 
 def helper_realized_ast(r:Tensor|list[Tensor]) -> tuple[UOp, list[Buffer]]:
   if isinstance(r, Tensor): r = [r]
-  s = Tensor.schedule(*r)
-  run_schedule(s[:-1])  # run all kernels except the last one
-  assert s[-1].ast.op is Ops.SINK, f"helper_realized_ast expects a SINK {s[-1]}"
-  # now all input buffers in s[-1] should be realized
+  linear, var_vals = Tensor.linear_with_vars(*r)
+  run_linear(UOp(Ops.LINEAR, src=linear.src[:-1]), var_vals)  # run all kernels except the last one
+  last_call = linear.src[-1]
+  ast = last_call.src[0]
+  assert ast.op is Ops.SINK, f"helper_realized_ast expects a SINK {last_call}"
+  last_bufs = [s.buffer for s in last_call.src[1:] if s.op is not Ops.BIND]
+  # now all input buffers in last_call should be realized
   # create fresh buffers for the outputs
-  bufs = [Buffer(x.device, x.size, x.dtype).allocate() if i < len(s[-1].ast.src) else x for i,x in enumerate(s[-1].bufs)]
+  bufs = [Buffer(x.device, x.size, x.dtype).allocate() if i < len(ast.src) else x for i,x in enumerate(last_bufs)]
   # ensure buffers are allocated
   for b in bufs: b.ensure_allocated()
-  return s[-1].ast, bufs
+  return ast, bufs
 
 def helper_linearizer_ast(ast:UOp, inputs:list[Tensor], *args, **kwargs):
   assert isinstance(ast, UOp), "ast must be UOp"

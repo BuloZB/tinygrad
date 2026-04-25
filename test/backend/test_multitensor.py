@@ -1,13 +1,13 @@
-import unittest, functools, random
+import unittest, random
 from tinygrad import Tensor, Device, nn, GlobalCounters, TinyJit, dtypes, Variable
 from tinygrad.device import is_dtype_supported
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.helpers import getenv, prod, Context
 from tinygrad.nn.state import get_parameters, get_state_dict
-from tinygrad.engine.realize import BufferCopy, CompiledRunner, run_schedule
+from tinygrad.engine.realize import CompiledRunner, run_linear
 import numpy as np
 from hypothesis import given, strategies as strat, settings
-from test.helpers import not_support_multi_device, needs_second_gpu, slow
+from test.helpers import not_support_multi_device, needs_second_gpu, slow, call_is_graph
 
 settings.register_profile("my_profile", max_examples=200, deadline=None, derandomize=getenv("DERANDOMIZE_CI", False))
 settings.load_profile("my_profile")
@@ -192,11 +192,11 @@ class TestMultiTensor(unittest.TestCase):
     # only shrink on the device that owns the shard, this is enabled by the mselect simplifier
     for i in range(2):
       xt = X[i*2:i*2+2].contiguous()
-      sched = xt.schedule()
-      #kernels = [s for s in sched if s.ast.op is Ops.SINK]
+      linear, var_vals = xt.linear_with_vars()
+      #kernels = [call for call in linear.src if call.src[0].op is Ops.SINK]
       #self.assertEqual(len(kernels), 1)
-      #self.assertEqual(kernels[0].bufs[0].device, devices_2[i])
-      run_schedule(sched)
+      #self.assertEqual(kernels[0].src[1].buffer.device, devices_2[i])
+      run_linear(linear, var_vals)
       np.testing.assert_equal(xt.numpy(), X_np[i*2:i*2+2])
 
   @given(strat.sampled_from((devices_2, devices_3)),
@@ -274,6 +274,14 @@ class TestMultiTensor(unittest.TestCase):
       tt = Tensor.arange(0, 4).contiguous().realize().shard((d1,d2), 0).realize()
       out = f(tt)
       assert out.item() == 1+2+3+4
+
+  def test_multitensor_jit_input_reduce_shard_axis(self):
+    @TinyJit
+    def f(x): return x.sum(0).realize()
+    for _ in range(5):
+      tt = Tensor.ones(2, 64).contiguous().realize().shard((d1,d2), 0).realize()
+      out = f(tt)
+      np.testing.assert_allclose(out.numpy(), np.full(64, 2.0))
 
   def test_multitensor_inside_jit(self):
     @TinyJit
@@ -544,7 +552,22 @@ class TestMultiTensor(unittest.TestCase):
       b.shard_(devices_2)
       c = jf(a, b)
       np.testing.assert_allclose(c.numpy(), a.numpy()+b.numpy(), atol=1e-4, rtol=1e-5)
-    assert len(jf.jit_cache) > 0
+    assert jf.captured is not None
+
+  def test_multi_tensor_jit_graph_assign_updates_each_shard(self):
+    @TinyJit
+    def jf(out: Tensor) -> Tensor:
+      tmp = (Tensor.arange(4, dtype=dtypes.float).shard(devices_2, 0) + 1).contiguous().realize()
+      out.assign((tmp + 1).contiguous()).realize()
+      return out
+
+    out = Tensor.full((4,), -1.0).shard(devices_2, 0).contiguous().realize()
+    expected = np.arange(4, dtype=np.float32) + 2
+    for _ in range(5):
+      out.assign(Tensor.full((4,), -1.0).shard(devices_2, 0).contiguous()).realize()
+      jf(out)
+      np.testing.assert_allclose(out.numpy(), expected, atol=1e-4, rtol=1e-5)
+    assert jf.captured is not None
 
   def test_multi_tensor_jit_body(self):
     @TinyJit
@@ -558,7 +581,7 @@ class TestMultiTensor(unittest.TestCase):
     for _ in range(5):
       r = jf()
       np.testing.assert_allclose(r.numpy(), np.ones(256)+np.ones(256), atol=1e-4, rtol=1e-5)
-    assert len(jf.jit_cache) > 0
+    assert jf.captured is not None
 
   def test_multitensor_jit_in_list(self):
     # test MULTI tensor inside a list container - exercises the container unpacking + MULTI unpacking
@@ -618,15 +641,12 @@ class TestMultiTensor(unittest.TestCase):
       o = jf(a, b, c, d).numpy()
       np.testing.assert_allclose(ref, o, atol=1e-4, rtol=1e-5)
 
-    graph_d0 = Device[d0].graph.func if isinstance(Device[d0].graph, functools.partial) else Device[d0].graph
-    graph_d1 = Device[d1].graph.func if isinstance(Device[d1].graph, functools.partial) else Device[d1].graph
     # Checking that 2 graphs per device, 1 copy and 1 last graph on device 1 are created.
-    assert isinstance(jf.jit_cache[0].prg, graph_d0)
-    assert isinstance(jf.jit_cache[1].prg, graph_d0)
-    assert isinstance(jf.jit_cache[2].prg, graph_d1)
-    assert isinstance(jf.jit_cache[3].prg, graph_d1)
-    assert isinstance(jf.jit_cache[4].prg, BufferCopy)
-    assert isinstance(jf.jit_cache[5].prg, graph_d1)
+    sis = jf.captured.linear.src
+    assert len(sis) == 6
+    for si in (sis[0], sis[1], sis[2], sis[3], sis[5]):
+      assert call_is_graph(si)
+    assert sis[4].src[0].op is Ops.COPY
 
   def test_bn_ast_on_devices(self):
     t = Tensor.empty((16, 64, 112, 112)).shard(devices_4, axis=0)
@@ -645,7 +665,7 @@ class TestMultiTensor(unittest.TestCase):
     rng = Tensor.rand((10, 10, 10))
     t0 = rng.shard(devices_2, axis=1)
     out = t0.flip(0) + 1
-    self.assertTrue((rng.flip(0)+1).allclose(out.to(rng.device)))
+    self.assertTrue((rng.flip(0)+1).allclose(out.to(rng.device)).item())
 
   @unittest.skip("flaky")
   def test_reshape_on_axis(self):
@@ -787,9 +807,9 @@ class TestMultiTensor(unittest.TestCase):
   def test_full_like_shrink_on_shard_axis(self):
     t = Tensor.ones(16, 16, dtype=dtypes.int).shard(devices_2, axis=0)
     out = Tensor.full_like(t, 2)[:, :8]
-    sched = out.schedule()
-    self.assertEqual(len(sched), 0)
-    run_schedule(sched)
+    linear, var_vals = out.linear_with_vars()
+    self.assertEqual(len(linear.src), 0)
+    run_linear(linear, var_vals)
     self.assertEqual(out.tolist(), [[2]*8]*16)
 
   def test_dropout_on_shard(self):
@@ -1138,13 +1158,13 @@ class TestMultiBufferView(unittest.TestCase):
   def setUp(self): pass
 
   def _check(self, a_ref:Tensor, a_multi:Tensor, view_fn):
-    """Apply view_fn to both, verify zero compiled kernels and matching values."""
     b_ref = view_fn(a_ref)
     b_multi = view_fn(a_multi).contiguous()
-    sched = b_multi.schedule()
-    compiled = [si for si in sched if isinstance(si.prg, CompiledRunner)]
-    self.assertEqual(len(compiled), 0, f"expected zero compiled kernels, got {len(compiled)}")
-    run_schedule(sched)
+    linear, var_vals = b_multi.linear_with_vars()
+    if all(hasattr(Device[d].allocator, "_offset") for d in b_multi.device):
+      compiled = [call for call in linear.src if call.src[0].op is Ops.SINK]
+      self.assertEqual(len(compiled), 0, f"expected zero compiled kernels, got {len(compiled)}")
+    run_linear(linear, var_vals)
     np.testing.assert_equal(b_multi.numpy(), b_ref.numpy())
 
   @unittest.skip("flaky on LLVM")
@@ -1171,11 +1191,13 @@ class TestMultiBufferView(unittest.TestCase):
   def test_4_devices(self):
     ref = Tensor.arange(8*12).reshape(8, 12).contiguous().realize()
     a = Tensor.arange(8*12).reshape(8, 12).contiguous().shard(devices_4, axis=1).realize()
-    sched = a[5].contiguous().schedule()
-    compiled = [si for si in sched if isinstance(si.prg, CompiledRunner)]
-    self.assertEqual(len(compiled), 0)
-    run_schedule(sched)
-    np.testing.assert_equal(a[5].contiguous().numpy(), ref[5].numpy())
+    out = a[5].contiguous()
+    linear, var_vals = out.linear_with_vars()
+    if all(hasattr(Device[d].allocator, "_offset") for d in out.device):
+      compiled = [call for call in linear.src if call.src[0].op is Ops.SINK]
+      self.assertEqual(len(compiled), 0)
+    run_linear(linear, var_vals)
+    np.testing.assert_equal(out.numpy(), ref[5].numpy())
 
 @unittest.skipIf(not_support_multi_device(), "need multi")
 class TestMultiFromUnrenderable(unittest.TestCase):

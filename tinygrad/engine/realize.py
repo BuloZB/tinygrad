@@ -4,10 +4,11 @@ from dataclasses import dataclass, replace, field
 from tinygrad.helpers import colored, DEBUG, GlobalCounters, ansilen, NOOPT, all_int, Metadata, TRACEMETA, TracingKey
 from tinygrad.helpers import BEAM, DEVECTORIZE, size_to_str, time_to_str, VALIDATE_WITH_CPU, cpu_profile, PROFILE, ProfilePointEvent, cpu_events
 from tinygrad.helpers import prod, EMULATED_DTYPES, flatten
-from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat, sym_infer, buffers, graph_rewrite
+from tinygrad.dtype import dtypes
+from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat, sym_infer, buffers, graph_rewrite, ProgramInfo
 from tinygrad.device import Device, Buffer, MultiBuffer
-from tinygrad.renderer import ProgramSpec, Estimates
-from tinygrad.codegen import get_program, to_program
+from tinygrad.renderer import Estimates
+from tinygrad.codegen import to_program
 
 # **************** Stat ****************
 
@@ -19,6 +20,8 @@ def estimate_uop(call:UOp) -> Estimates:
   if ast.op is Ops.COPY or (ast.op is Ops.CUSTOM_FUNCTION and ast.arg == "encdec"):
     nbytes = prod(call.src[1].shape) * call.src[1].dtype.itemsize
     return Estimates(lds=nbytes, mem=nbytes)
+  if ast.op is Ops.CUSTOM_FUNCTION and ast.arg == "graph":
+    return runner.estimates if (runner:=graph_cache.get(ast)) is not None else Estimates()
   return Estimates()
 
 def update_stats(display_name:str, device:str, estimates:Estimates, var_vals:dict[str, int], et:float|None, buf_count:int,
@@ -67,19 +70,22 @@ def optimize_local_size(_prg:Callable, global_size:list[int], rawbufs:list[Buffe
   return ret[1]
 
 class CompiledRunner(Runner):
-  def __init__(self, p:ProgramSpec, prg=None):
-    if DEBUG >= 3 and p.applied_opts: print(p.applied_opts)
-    if DEBUG >= 4: print(p.src)
-    if p.lib is None:
-      with cpu_profile(TracingKey(f"compile {p.name}", (p.function_name,)), "TINY"):
-        p = replace(p, lib=Device[p.device].compiler.compile_cached(p.src))
-    self.p:ProgramSpec = p
-    assert self.p.lib is not None
-    if DEBUG >= 7: Device[p.device].compiler.disassemble(self.p.lib)
-    self._prg = Device[p.device].runtime(p.function_name, self.p.lib, *p.aux, runtimevars=p.runtimevars) if prg is None else prg
-    super().__init__(p.name, p.device, p.estimates)
+  def __init__(self, prg:UOp, _prg=None):
+    info: ProgramInfo = prg.arg
+    sink = prg.src[0]
+    if DEBUG >= 3 and sink.arg.applied_opts: print(sink.arg.applied_opts)
+    if DEBUG >= 4: print(prg.src[3].arg)
+    if len(prg.src) <= 4 or prg.src[4].op is not Ops.BINARY:
+      with cpu_profile(TracingKey(f"compile {info.name}", (info.function_name,)), "TINY"):
+        lib = Device[info.device].compiler.compile_cached(prg.src[3].arg)
+      prg = prg.replace(src=prg.src + (UOp(Ops.BINARY, arg=lib),))
+    self.prg:UOp = prg
+    self.p:ProgramInfo = info
+    if DEBUG >= 7: Device[info.device].compiler.disassemble(prg.src[4].arg)
+    self._prg = Device[info.device].runtime(info.function_name, prg.src[4].arg, *info.aux, runtimevars=info.runtimevars) if _prg is None else _prg
+    super().__init__(info.name, info.device, sink.arg.estimates or Estimates())
 
-  def __reduce__(self): return self.__class__, (self.p,)
+  def __reduce__(self): return self.__class__, (self.prg,)
 
   def __call__(self, rawbufs:list[Buffer], var_vals:dict[str, int]|None=None, wait=False, timeout:int|None=None) -> float|None:
     if var_vals is None: var_vals = {}
@@ -87,7 +93,7 @@ class CompiledRunner(Runner):
     if Device[self.p.device].renderer.has_local and local_size is None and all_int(self.p.global_size):
       local_size = optimize_local_size(self._prg, global_size, rawbufs)
       global_size = [g//l if g%l == 0 else g/l for g,l in zip(global_size, local_size)]
-      self.p = replace(self.p, global_size=global_size, local_size=local_size)
+      self.p = replace(self.p, global_size=tuple(global_size), local_size=tuple(local_size))
     return self._prg(*[x._buf for x in rawbufs], global_size=tuple(global_size), local_size=tuple(local_size) if local_size else None,
                      vals=tuple(var_vals[k.expr] if k.expr not in self.p.runtimevars else None for k in self.p.vars), wait=wait, timeout=timeout)
 
@@ -101,10 +107,10 @@ def get_runner(device:str, ast:UOp) -> CompiledRunner:
   if cret:=method_cache.get(ckey): return cret
   bkey = (device.split(":")[0], type(Device[device].compiler), ast.key, context, True)
   if bret:=method_cache.get(bkey):
-    method_cache[ckey] = ret = CompiledRunner(replace(bret.p, device=device))
+    method_cache[ckey] = ret = CompiledRunner(bret.prg.replace(arg=replace(bret.p, device=device)))
   else:
-    prg: ProgramSpec = get_program(ast, Device[device].renderer)
-    method_cache[ckey] = method_cache[bkey] = ret = CompiledRunner(replace(prg, device=device))
+    prg = to_program(ast, Device[device].renderer)
+    method_cache[ckey] = method_cache[bkey] = ret = CompiledRunner(prg.replace(arg=replace(prg.arg, device=device)))
   return ret
 
 # **************** run linear ****************
@@ -172,19 +178,18 @@ def exec_kernel(ctx:ExecContext, call, ast):
     prg = get_runner(bufs[0].device, ast)
     prg_bufs = [bufs[i].ensure_allocated() for i in prg.p.globals]
 
-    if VALIDATE_WITH_CPU and ast.op is Ops.SINK:
-      cpu_bufs = [Buffer("CPU", b.size, b.dtype).ensure_allocated().copyin(b.ensure_allocated().as_memoryview()) for b in bufs]
-
     with track_stats(ctx, call, prg.device, prg.display_name, prg_bufs, var_vals,
                      outputs=tuple(prg.p.outs), inputs=tuple(prg.p.ins), first_run=prg.first_run) as timing:
       timing[0] = prg(prg_bufs, var_vals, wait=DEBUG >= 2)
       prg.first_run = False
 
-    if VALIDATE_WITH_CPU and ast.op is Ops.SINK:
-      import numpy as np
-      cpu_prg = get_runner("CPU", ast)
-      cpu_prg([cpu_bufs[i] for i in cpu_prg.p.globals], var_vals, wait=False)
-      for i in prg.p.outs: np.testing.assert_allclose(prg_bufs[i].numpy(), cpu_bufs[i].numpy(), rtol=1e-3, atol=1e-3)
+def exec_validate(ctx:ExecContext, call, ast):
+  import numpy as np
+  for bufs, device_vars in unwrap_multi(call, resolve_params(call, ctx.input_uops)):
+    cpu_bufs, dev_bufs = bufs[:len(bufs)//2], bufs[len(bufs)//2:]
+    cpu_prg = get_runner("CPU", ast.src[0])
+    cpu_prg([cpu_bufs[i].ensure_allocated() for i in cpu_prg.p.globals], {**ctx.var_vals, **device_vars}, wait=False)
+    for i in cpu_prg.p.outs: np.testing.assert_allclose(dev_bufs[i].ensure_allocated().numpy(), cpu_bufs[i].numpy(), rtol=1e-3, atol=1e-3)
 
 def exec_encdec(ctx:ExecContext, call, ast):
   bufs = [cast(Buffer, b.buffer).ensure_allocated() for b in resolve_params(call, ctx.input_uops)]
@@ -200,6 +205,19 @@ def exec_graph(ctx:ExecContext, call, cf):
   with track_stats(ctx, call, runner.device, runner.display_name, bufs, ctx.var_vals) as t:
     t[0] = runner(bufs, ctx.var_vals, wait=DEBUG >= 2, input_uops=ctx.input_uops) # type: ignore[call-arg]
 
+# flatten LINEAR-in-LINEAR: any nested LINEAR child gets inlined into its parent's src
+pm_flatten_linear = PatternMatcher([
+  (UPat(Ops.LINEAR, custom_early_reject={Ops.LINEAR}, name="lin"),
+   lambda lin: lin.replace(src=tuple(flatten(c.src if c.op is Ops.LINEAR else (c,) for c in lin.src)))),
+])
+
+def _validate(call:UOp, sink:UOp) -> UOp:
+  params = tuple(p for p in call.src[1:] if p.op is not Ops.BIND)
+  shadows = tuple(UOp.new_buffer(("CPU",)*len(p.device) if isinstance(p.device, tuple) else "CPU", prod(p.max_shape), p.dtype.base) for p in params)
+  copies = tuple(p.copy_to_device(s.device).call(s, p) for s, p in zip(shadows, params))
+  return UOp(Ops.LINEAR, src=copies + (call, UOp(Ops.CUSTOM_FUNCTION, dtypes.void, src=(sink,), arg="validate").call(*shadows, *params)))
+pm_validate = PatternMatcher([(UPat(Ops.CALL, src=(UPat(Ops.SINK, name="sink"),), name="call", allow_any_len=True), _validate)]) + pm_flatten_linear
+
 # ctx is beam value
 pm_beam = PatternMatcher([
   (UPat(Ops.CALL, src=(UPat(Ops.SINK, name="sink"),), name="call", allow_any_len=True),
@@ -214,16 +232,18 @@ pm_compile = PatternMatcher([
 pm_exec = PatternMatcher([
   (UPat(Ops.CALL, src=(UPat(Ops.BUFFER_VIEW, name="ast"),), name="call", allow_any_len=True), exec_view),
   (UPat(Ops.CALL, src=(UPat(Ops.COPY, name="ast"),), name="call", allow_any_len=True), exec_copy),
-  (UPat(Ops.CALL, src=(UPat((Ops.PROGRAM, Ops.SINK), name="ast"),), name="call", allow_any_len=True), exec_kernel),
+  (UPat(Ops.CALL, src=(UPat(Ops.PROGRAM, name="ast"),), name="call", allow_any_len=True), exec_kernel),
   (UPat(Ops.CALL, src=(UPat(Ops.CUSTOM_FUNCTION, arg="encdec", name="ast"),), name="call", allow_any_len=True), exec_encdec),
   (UPat(Ops.CALL, src=(UPat(Ops.CUSTOM_FUNCTION, arg="graph", name="cf"),), name="call", allow_any_len=True), exec_graph),
+  (UPat(Ops.CALL, src=(UPat(Ops.CUSTOM_FUNCTION, arg="validate", name="ast"),), name="call", allow_any_len=True), exec_validate),
 ])
 
-def compile_linear(linear:UOp, beam=0) -> UOp:
+def compile_linear(linear:UOp, beam=0, validate=False) -> UOp:
+  if validate: linear = graph_rewrite(linear, pm_validate, name="validate", walk=True)
   if (beam_val:=(beam or BEAM.value)) >= 1: linear = graph_rewrite(linear, pm_beam, ctx=beam_val, walk=True)
-  return graph_rewrite(linear, pm_compile, name="precompile kernels", walk=True) if not VALIDATE_WITH_CPU else linear
+  return graph_rewrite(linear, pm_compile, name="precompile kernels", walk=True)
 
 def run_linear(linear:UOp, var_vals:dict[str, int]|None=None, input_uops:tuple[UOp, ...]=(), do_update_stats=True, jit=False):
-  if not jit: linear = compile_linear(linear)
+  if not jit: linear = compile_linear(linear, validate=VALIDATE_WITH_CPU)
   ctx = ExecContext(var_vals or {}, input_uops, do_update_stats, jit)
   for call in linear.src: pm_exec.rewrite(call, ctx)

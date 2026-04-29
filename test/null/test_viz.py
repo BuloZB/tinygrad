@@ -321,7 +321,6 @@ class TestVizGC(unittest.TestCase):
 # VIZ integrates with other parts of tinygrad
 
 from tinygrad import Tensor, Device
-from tinygrad.engine.realize import get_runner
 
 class TestVizIntegration(unittest.TestCase):
   # codegen supports rendering of code blocks
@@ -725,11 +724,11 @@ class TestCfg(unittest.TestCase):
       return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.DEVICE, arg="NULL"), UOp(Ops.LINEAR, src=tuple([UOp(Ops.INS, arg=x) for x in insts]))))
     with Context(DEV=f"NULL::{self.arch}"):
       out = Tensor.custom_kernel(Tensor.empty(1), fxn=fxn)[0]
-      runner = get_runner(out.device, out.schedule_linear().src[-1].src[0])
-      return amdgpu_cfg(runner.prg.src[4].arg, self.arch)
+      prg = to_program(out.schedule_linear().src[-1].src[0], Device[out.device].renderer)
+      return amdgpu_cfg(prg.src[4].arg, self.arch)
 
   def test_simple(self):
-    k = Kernel(arch=self.arch)
+    k = Kernel()
     k.label("entry")
     k.emit(s_branch(), target="bb1")
     k.label("bb1")
@@ -739,7 +738,7 @@ class TestCfg(unittest.TestCase):
     self.assertEqual(len(cfg["blocks"]), 2)
 
   def test_diamond(self):
-    k = Kernel(arch=self.arch)
+    k = Kernel()
     k.label("entry")
     k.emit(s_mov_b32(s[0], 0))
     k.emit(s_mov_b32(s[1], 0))
@@ -773,7 +772,7 @@ class TestCfg(unittest.TestCase):
       assert st.startswith("s_code_end") and st.endswith("x)"), st
 
   def test_loop(self):
-    k = Kernel(arch=self.arch)
+    k = Kernel()
     k.label("entry")
     k.emit(s_mov_b32(s[1], 4))
     k.label("loop")
@@ -785,7 +784,7 @@ class TestCfg(unittest.TestCase):
     self.get_cfg("simple_loop", k)
 
   def test_loop_branch(self):
-    k = Kernel(arch=self.arch)
+    k = Kernel()
     k.label("entry")
     k.emit(s_mov_b32(s[1], 4))
     k.label("loop")
@@ -803,7 +802,7 @@ class TestCfg(unittest.TestCase):
     self.get_cfg("loop_if", k)
 
   def test_loop_break(self):
-    k = Kernel(arch=self.arch)
+    k = Kernel()
     k.label("entry")
     k.emit(s_mov_b32(s[1], 8))
     k.label("loop")
@@ -818,7 +817,7 @@ class TestCfg(unittest.TestCase):
     self.get_cfg("loop_break", k)
 
   def test_switch(self):
-    k = Kernel(arch=self.arch)
+    k = Kernel()
     k.label("entry")
     k.emit(s_cmp_eq_i32(s[0], 0))
     k.emit(s_cbranch_scc1(), target="case0")
@@ -840,7 +839,7 @@ class TestCfg(unittest.TestCase):
     self.get_cfg("switch_case", k)
 
   def test_ping_pong(self):
-    k = Kernel(arch=self.arch)
+    k = Kernel()
     k.label("entry")
     k.emit(s_cmp_eq_i32(s[0], 0))
     k.emit(s_cbranch_scc1(), target="ping")
@@ -859,7 +858,7 @@ class TestCfg(unittest.TestCase):
 
   def test_colored_blocks(self):
     N = 10
-    k = Kernel(arch=self.arch)
+    k = Kernel()
     k.label("entry")
     k.emit(s_branch(), target="init0")
     for i in range(N):
@@ -879,7 +878,7 @@ class TestCfg(unittest.TestCase):
     self.get_cfg("test_colored_blocks", k)
 
   def test_jump_back_to_end(self):
-    k = Kernel(arch=self.arch)
+    k = Kernel()
     k.label("entry")
     k.emit(s_mov_b32(s[1], 2))
     k.emit(s_cbranch_execz(), target="loop")

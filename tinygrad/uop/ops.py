@@ -90,13 +90,13 @@ class UOpMetaClass(type):
       assert op is Ops.BUFFER, f"trying to set Buffer {_buffer} for {op}"
       buffers[created] = _buffer
     if SPEC > 1:
-      from tinygrad.uop.spec import full_spec, test_pyrender
+      from tinygrad.uop.spec import spec_full, test_pyrender
       if SPEC > 2:
         # SPEC=3 checks the shape
         _ = created._shape
         if SPEC > 3:
           test_pyrender(created)
-      with Context(CHECK_OOB=0): fret = cast(bool|None, full_spec.rewrite(created))
+      with Context(CHECK_OOB=0): fret = cast(bool|None, spec_full.rewrite(created))
       if fret is not True: raise RuntimeError(f"SPEC ISSUE {fret}: {created}")
     return created
 
@@ -258,7 +258,7 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
       case Ops.WMMA | Ops.SHAPED_WMMA: return self.src[2]._shape
 
       # passthrough ops
-      case Ops.MSTACK | Ops.MSELECT | Ops.DETACH | Ops.CONTIGUOUS | Ops.CONTIGUOUS_BACKWARD | Ops.AFTER | Ops.LOAD:
+      case Ops.MSTACK | Ops.MSELECT | Ops.DETACH | Ops.CONTIGUOUS | Ops.CONTIGUOUS_BACKWARD | Ops.AFTER | Ops.PATCH | Ops.LOAD:
         return self.src[0]._shape
       # REDUCE with empty axis is passthrough (lowered form)
       case Ops.REDUCE if len(self.arg[1]) == 0:
@@ -466,6 +466,8 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
   def store(self, src:UOp|ConstType, gate:UOp|None=None, **kwargs):
     srcs = (self, self.const_like(src) if not isinstance(src, UOp) else src) + ((gate,) if gate is not None else ())
     return UOp(Ops.STORE, dtypes.void, srcs, **kwargs)
+  def wait(self, src:UOp|ConstType, **kwargs):
+    return UOp(Ops.WAIT, dtypes.void, (self, self.const_like(src) if not isinstance(src, UOp) else src), **kwargs)
   def end(self, *src:UOp): return UOp(Ops.END, src=(self,)+src) if len(src) else self
   def after(self, *src:UOp, **kwargs): return UOp(Ops.AFTER, self.dtype, (self,)+src, **kwargs) if len(src) else self
   def barrier(self, *src:UOp): return UOp(Ops.BARRIER, src=(self,)+src)
@@ -509,7 +511,8 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
     return UOp(Ops.REDUCE, self.dtype, (self,), (op, axis)) if len(axis) else self
   @staticmethod
   def invalid(count=1): return UOp(Ops.CONST, dtypes.weakint.vec(count), src=(), arg=Invalid)
-  def valid(self, cond): return self if cond.op is Ops.WHERE and cond.arg else cond.where(self, UOp.invalid(self.dtype.count))
+  def valid(self, cond):
+    return self if cond.op is Ops.WHERE and cond.arg else cond.where(self.cast(dtypes.weakint), UOp.invalid(self.dtype.count))
   def get_idx(self) -> UOp:
     assert self.dtype.scalar() is dtypes.weakint, "Can only call get_idx on index dtype"
     return self.src[1] if self.op is Ops.WHERE and self.src[2].arg is Invalid else self
@@ -659,6 +662,10 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
   @staticmethod
   def new_buffer(device:str|tuple[str, ...], size:int, dtype:DType, num=None):
     return UOp(Ops.BUFFER, dtype, (UOp.unique(num), UOp(Ops.DEVICE, arg=device)), size)
+  @staticmethod
+  def from_buffer(opaque:Buffer, device:str|tuple[str, ...]|None=None):
+    buffers[uop:=UOp.new_buffer(device or opaque.device, opaque.size, opaque.dtype)] = opaque.ref(1)
+    return uop
   @staticmethod
   def empty(shape:tuple[sint, ...], dtype:DTypeLike|None=None, device:str|tuple[str, ...]|None=None, axis:int|None=None, num=None) -> UOp:
     dtype, device = to_dtype(dtype) if dtype is not None else dtypes.default_float, canonicalize_device(device)

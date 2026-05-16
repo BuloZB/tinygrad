@@ -179,8 +179,7 @@ class TestTinygrad(unittest.TestCase):
     def test_tinygrad():
       w1 = Tensor(init)
       w2 = Tensor(init)
-      assert w1.requires_grad is None and w2.requires_grad is None
-      # optimizer sets requires_grad=True for params with requires_grad=None
+      assert w1.requires_grad is True and w2.requires_grad is True
       nn.optim.SGD([w1, w2], lr=0.01)
       assert w1.requires_grad is True and w2.requires_grad is True
       out = w1.add(w2)
@@ -189,21 +188,6 @@ class TestTinygrad(unittest.TestCase):
 
     for x, y in zip(test_tinygrad(), test_pytorch()):
       np.testing.assert_allclose(x, y, atol=1e-5)
-
-  def test_nograd(self):
-    x = Tensor(x_init, requires_grad=False)
-    m = Tensor(m_init, requires_grad=False)
-    W = Tensor(W_init, requires_grad=True)
-    tmp = x.mul(m)
-    mm = tmp.matmul(W)
-    out = mm.relu()
-    out = out.sum()
-    out.backward()
-    assert x.grad is None
-    assert m.grad is None
-    assert tmp.grad is None
-    assert mm.grad is not None
-    assert W.grad is not None
 
   def test_dropout(self):
     with Tensor.train():
@@ -599,7 +583,7 @@ class TestMoveTensor(unittest.TestCase):
     assert x is y
 
   def test_to_grad(self):
-    x = Tensor.eye(3, requires_grad=True, device=self.d0)
+    x = Tensor.eye(3, device=self.d0)
     y = Tensor([[2.0,0,-2.0]], requires_grad=True, device=self.d0)
     z = y.matmul(x).to(self.d1).sum()
     z.backward()

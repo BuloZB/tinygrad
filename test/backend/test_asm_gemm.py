@@ -1,6 +1,5 @@
 import unittest
 from tinygrad import Tensor, Device, dtypes, Context
-from tinygrad.device import is_dtype_supported
 from tinygrad.helpers import getenv, system, DEV
 from extra.gemm.cdna_asm_gemm import asm_gemm
 from test.helpers import needs_second_gpu
@@ -13,8 +12,8 @@ def is_cdna4(): return Device[Device.DEFAULT].renderer.target.arch.startswith("g
 def run_asm_gemm(a_shape, b_shape, dtype=dtypes.float16, a_shard=None, b_shard=None, gpus:int=1) -> None:
   Tensor.manual_seed(0)
   input_dtype = dtypes.bfloat16 if dtype == FP8_DTYPE else dtype
-  a_rand = Tensor.randn(a_shape, dtype=dtypes.float, requires_grad=False).sub(0.5).cast(input_dtype)
-  b_rand = Tensor.randn(b_shape, dtype=dtypes.float, requires_grad=False).sub(0.5).cast(input_dtype)
+  a_rand = Tensor.randn(a_shape, dtype=dtypes.float).sub(0.5).cast(input_dtype)
+  b_rand = Tensor.randn(b_shape, dtype=dtypes.float).sub(0.5).cast(input_dtype)
   with Context(DEBUG=0):
     Tensor.realize(a_rand, b_rand)
 
@@ -30,7 +29,7 @@ def run_asm_gemm(a_shape, b_shape, dtype=dtypes.float16, a_shard=None, b_shard=N
   # clone all inputs before any backward: a clone copies the source's current .grad
   a, b = a_rand.clone(), b_rand.clone()
   if dtype == FP8_DTYPE:
-    a_ref, b_ref = a_rand.detach().cast(dtypes.bfloat16).requires_grad_(), b_rand.detach().cast(dtypes.bfloat16).requires_grad_()
+    a_ref, b_ref = a_rand.detach().cast(dtypes.bfloat16), b_rand.detach().cast(dtypes.bfloat16)
   else:
     a_ref, b_ref = a_rand.clone(), b_rand.clone()
   if multi: a, b = a.shard(devs, axis=a_shard), b.shard(devs, axis=b_shard)
@@ -85,7 +84,7 @@ def verify_asm_gemm_k_sharded_3d(batch:int, M:int, N:int, K:int, dtype=dtypes.fl
 
 # 128x smaller than usual
 # uses the UOp GEMM, runs on non CDNA4 and CI
-@unittest.skipUnless(is_dtype_supported(dtypes.half), "need half")
+@unittest.skipUnless(dtypes.half in Device[Device.DEFAULT].renderer.supported_dtypes(), "need half")
 class TestGemm(unittest.TestCase):
   def setUp(self):
     if is_cdna4(): self.skipTest("shapes are too small for the assembly GEMM")
@@ -152,8 +151,8 @@ class TestGemmLlama(unittest.TestCase):
   def test_empty(self): asm_gemm(Tensor.empty(N:=getenv("N", 4096), N, dtype=self.dtype), Tensor.empty(N, N, dtype=self.dtype)).realize()
 
   def test_empty_bw(self):
-    x = Tensor.empty(1, N:=getenv("N", 4096), N, dtype=self.dtype, requires_grad=True)
-    y = Tensor.empty((N, N), dtype=self.dtype, requires_grad=True)
+    x = Tensor.empty(1, N:=getenv("N", 4096), N, dtype=self.dtype)
+    y = Tensor.empty((N, N), dtype=self.dtype)
     if self.dtype == FP8_DTYPE:
       x_scale = Tensor.empty((), dtype=dtypes.float32)
       w_scale = Tensor.empty((), dtype=dtypes.float32)

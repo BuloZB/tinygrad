@@ -5,9 +5,9 @@
 from typing import Any, TYPE_CHECKING
 import pickle, base64, itertools, time, sys, functools
 from dataclasses import replace
-from tinygrad.dtype import DType, dtypes, ImageDType, PtrDType, truncate, storage_fmt_for_dtype, to_storage_scalar, from_storage_scalar
-from tinygrad.helpers import all_same, getenv, flatten, get_single_element, Target, IMAGE
-from tinygrad.device import Compiled, Compiler, Allocator
+from tinygrad.dtype import DType, dtypes, AddrSpace, truncate, storage_fmt_for_dtype, to_storage_scalar, from_storage_scalar
+from tinygrad.helpers import all_same, getenv, flatten, Target, IMAGE, is_image_shape, cpu_profile
+from tinygrad.device import Buffer, Compiled, Compiler, Allocator
 from tinygrad.codegen.opt import tc
 from tinygrad.uop.ops import exec_alu, python_alu, Ops, UOp, GroupOp, bitcast
 from tinygrad.renderer import Renderer
@@ -81,39 +81,36 @@ class PythonProgram:
           store_gate = exec_masks[-1]
           for j,val in enumerate(src_values[1] if u.max_numel() > 1 else [src_values[1]]):
             for (m,o),v,g in zip(src_values[0], val, store_gate):
-              if g: _store(m, o+j, v, src_dtypes[1].scalar())
+              if g: _store(m, o+j, v, src_dtypes[1])
           i += 1
           continue
         if u.op is Ops.AFTER: values[u] = src_values[0]
-        elif u.op in {Ops.PARAM, Ops.DEFINE_LOCAL, Ops.DEFINE_REG}:
-          storage_fmt = storage_fmt_for_dtype(u.dtype.base.scalar())
+        elif u.op is Ops.PARAM and u.addrspace is AddrSpace.ALU: values[u] = [pvals.pop(0)] * warp_size
+        elif u.op in {Ops.PARAM, Ops.BUFFER}:
+          storage_fmt = storage_fmt_for_dtype(u.dtype)
           if storage_fmt is None: raise RuntimeError(f"dtype={u.dtype} is not supported")
           if TYPE_CHECKING or sys.version_info < (3, 12): assert storage_fmt != "e"
-          if u.op is Ops.DEFINE_REG:
+          if u.addrspace == AddrSpace.REG:
             # REGs are per thread
             values[u] = [memoryview(bytearray(u.max_numel()*u.dtype.itemsize)).cast(storage_fmt) for _ in range(warp_size)]
           else:
             buf = memoryview(bytearray(u.max_numel()*u.dtype.itemsize)) if u.op is not Ops.PARAM else pbufs.pop(0)
             values[u] = [buf.cast(storage_fmt)] * warp_size
-        elif u.op is Ops.DEFINE_VAR:
-          values[u] = [pvals.pop(0)] * warp_size
         elif u.op is Ops.SPECIAL:
           if u.arg[0] == 'g': values[u] = [idxs[2-int(u.arg[-1])]] * warp_size
           elif u.arg[0] == 'l': values[u] = [x[2-int(u.arg[-1])] for x in warp]
         elif u.op is Ops.CONST: values[u] = [u.arg] * warp_size
-        elif u.op is Ops.INDEX:
+        elif u.op in {Ops.INDEX, Ops.SHRINK}:
           ret:list = []
-          if isinstance(src_dtypes[0], ImageDType):
-            assert len(src_values) == 3, "image index must be 3 srcs"
+          if u.src[0].addrspace == AddrSpace.ALU:
+            ret = [src_values[0][i][t] for t,i in enumerate(src_values[1])]
+          elif is_image_shape(u.src[0]._shape):
             for m,oy,ox in zip(*src_values):
-              if ox < 0 or ox >= src_dtypes[0].shape[1] or oy < 0 or oy >= src_dtypes[0].shape[0]: ret.append((m, None))
-              else: ret.append((m, ox*4 + oy*src_dtypes[0].shape[1]*4))
+              if ox < 0 or ox >= u.src[0]._shape[1] or oy < 0 or oy >= u.src[0]._shape[0]: ret.append((m, None))
+              else: ret.append((m, ox*4 + oy*u.src[0]._shape[1]*4))
           else:
-            assert len(src_values) == 2, "non-image index must be 2 srcs"
-            for m,o in zip(*src_values): ret.append((m,o))
+            for m,o in zip(src_values[0], src_values[1]): ret.append((m,o))
           values[u] = ret
-        elif u.op is Ops.CAST and isinstance(u.dtype, PtrDType):
-          values[u] = src_values[0]
         elif u.op is Ops.RANGE:
           if u not in values: values[u] = [0] * warp_size
           else:
@@ -131,14 +128,13 @@ class PythonProgram:
           if (load_sz := u.max_numel()) > 1:
             # buf and gate are not vecs
             values[u] = [load([src_values[k] if k in [0,2] else src_values[k][j] \
-                               for k in range(len(src_values))], j, u.dtype.scalar()) for j in range(load_sz)]
+                               for k in range(len(src_values))], j, u.dtype) for j in range(load_sz)]
           else:
             values[u] = load(src_values, 0, u.dtype)
-        elif u.op is Ops.GEP: values[u] = src_values[0][get_single_element(u.arg)]
         elif u.op is Ops.WMMA:
           first_src_dtype = u.src[0].dtype
           assert isinstance(first_src_dtype, DType) # mypy
-          dims, dtype_in, device, threads = u.arg[1], first_src_dtype.scalar(), u.arg[4], u.arg[5]
+          dims, dtype_in, device, threads = u.arg[0], first_src_dtype, u.arg[2], u.arg[3]
           wmma_helper = functools.partial(generic_wmma_helper, src_values, warp_size)
           # TODO: refactor these to a shared TensorCoreLayout
           if device == "METAL":
@@ -191,18 +187,6 @@ class PythonProgram:
               values[u] = wmma_helper(32, 8, 4, 2, 4, a_elem, b_elem, c_map)
 
             else: raise NotImplementedError(f"unimplemented tensor core {u.arg}")
-          elif device == "INTEL":
-            # A (16 elements on 8 threads)
-            def a_elem(x, k, row, goff): return x[k%2+row*2][goff+k//2]
-            # B (16 elements on 8 threads)
-            def b_elem(x, col, k, goff): return x[k][goff+col]
-            # C, D (8 elements on 8 threads)
-            def c_map(lane, elem): return (lane, elem)
-            values[u] = wmma_helper(8, 16, 16, 16, 8, a_elem, b_elem, c_map)
-          elif device == "CPU":
-            def elem(x, col, row, _): return x[col+row][0] # k is always 0
-            def c_map(lane, elem): return (elem%16, elem//16)
-            values[u] = wmma_helper(1, 1, 16, 16, 256, elem, elem, c_map)
           else: raise NotImplementedError(f"unimplemented tensor core {u.arg}")
         elif u.op in GroupOp.ALU:
           assert all_same([len(x) for x in src_values]), f"{[len(x) for x in src_values]} doesn't match on {u.op}"
@@ -224,8 +208,6 @@ class PythonRenderer(Renderer):
       {"AMD":"gfx1100", "AMD_RDNA4":"gfx1201", "AMD_MFMA":"gfx950", "CUDA":"sm_80", "CUDA_SM75":"sm_75", "CUDA_SM89":"sm_89"}.get(emu, emu))
     target = replace(target, renderer="PYTHON")
     if target.arch == "METAL": self.target, self.tensor_cores = replace(target, device="METAL"), tc.metal
-    elif target.arch == "INTEL": self.target, self.suffix, self.tensor_cores = replace(target, device="INTEL"), "INTEL", tc.intel
-    elif target.arch == "AMX": self.target, self.tensor_cores = replace(target, device="CPU"), tc.amx
     elif target.arch.startswith("gfx"):
       self.target = replace(target, device="AMD")
       self.tensor_cores = tc.get_amd(target.arch)
@@ -241,8 +223,13 @@ class PythonRenderer(Renderer):
 
 class PythonAllocator(Allocator['PythonDevice']):
   def _alloc(self, size, options): return memoryview(bytearray(size))
-  def _copyin(self, dest, src:memoryview): dest[:] = src
-  def _copyout(self, dest:memoryview, src): dest[:] = src
+  def _as_buffer(self, src) -> memoryview: return src
+  def _copyin(self, dest, src:memoryview):
+    with cpu_profile("TINY -> PYTHON", f"{self.dev.device}:COPY"): dest[:] = src
+  def _copyout(self, dest:memoryview, src):
+    with cpu_profile("PYTHON -> TINY", f"{self.dev.device}:COPY"): dest[:] = src
+  def map(self, buf:Buffer): return buf.as_memoryview(force_zero_copy=True)
+  def _offset(self, buf:memoryview, size:int, offset:int): return buf[offset:offset+size]
 
 class PythonDevice(Compiled):
   def __init__(self, device:str):

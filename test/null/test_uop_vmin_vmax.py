@@ -1,6 +1,6 @@
 import unittest, math
 from tinygrad.uop.ops import UOp, Ops
-from tinygrad.dtype import dtypes, Invalid
+from tinygrad.dtype import dtypes, Invalid, truncate
 
 class TestVminVmaxProperties(unittest.TestCase):
   def test_vmin_vmax_constant(self):
@@ -82,7 +82,7 @@ class TestVminVmaxProperties(unittest.TestCase):
   def test_vmin_vmax_multiplication_0_inf(self):
     # vmin and vmax for multiplication with a variable
     x = UOp.const(0.0)
-    y = UOp.load(UOp.param(0, dtypes.float, (1,)), UOp.const(0), dtype=dtypes.float)
+    y = UOp.load(UOp.param(0, dtypes.float, 1), UOp.const(0))
     uop = x * y
     # TODO: these should be 0, but definitely should not be nan
     self.assertEqual(uop.vmin, -math.inf)
@@ -161,6 +161,16 @@ class TestVminVmaxProperties(unittest.TestCase):
     x_uint = x.cast(dtypes.uint)
     self.assertEqual(x_uint.vmin, dtypes.uint.min)
     self.assertEqual(x_uint.vmax, dtypes.uint.max)
+
+  def test_vmin_vmax_cast_float_to_int(self):
+    self.assertEqual(UOp.variable('x', -4.5, 4.5, dtypes.float).cast(dtypes.int)._min_max, (-4, 4))
+    self.assertEqual(UOp.const(4.5).cast(dtypes.float).cast(dtypes.int)._min_max, (4, 4))
+    x = UOp.const(4.5).cast(dtypes.float)
+    self.assertIs(x.ne(x.cast(dtypes.int).cast(dtypes.float)).simplify().arg, True)
+
+  def test_vmin_vmax_cast_int_to_float_grid(self):
+    # a cast to float only takes values on the float grid, so its bounds are the source bounds rounded at the destination
+    self.assertEqual(UOp.variable('x', 0, 16777219, dtypes.int).cast(dtypes.float)._min_max, (0.0, 16777220.0))
 
   def test_vmin_vmax_invalid(self):
     i = UOp.invalid()
@@ -311,8 +321,8 @@ class TestVminVmaxVConst(unittest.TestCase):
   def test_vmin_vmax_vconst_with_floats(self):
     # vmin and vmax for a vector constant of float values
     uop = UOp.const((1.5, -3.2, 0.0))
-    self.assertEqual(uop.vmin, -3.2)
-    self.assertEqual(uop.vmax, 1.5)
+    self.assertEqual(uop.vmin, truncate[dtypes.default_float](-3.2))
+    self.assertEqual(uop.vmax, truncate[dtypes.default_float](1.5))
 
   def test_vmin_vmax_vconst_with_bools(self):
     # vmin and vmax for a vector constant of bool values
@@ -322,7 +332,7 @@ class TestVminVmaxVConst(unittest.TestCase):
 
   def test_vmin_vmax_vector_with_gep(self):
     # vmin and vmax for a vector constant of bool values
-    d1 = UOp.param(1, dtypes.int, (1,))
+    d1 = UOp.param(1, dtypes.int, 1)
     idx = UOp.const(0)
     val = UOp(Ops.LOAD, src=(d1.index(idx),))
     uop = (val // 32)

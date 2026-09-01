@@ -2,7 +2,7 @@ import unittest, numpy as np
 from tinygrad import Tensor, Variable, Context, Device, TinyJit, GlobalCounters, dtypes, UOp, nn, getenv
 from tinygrad.nn.state import get_parameters, get_state_dict
 from tinygrad.uop.ops import Ops
-from test.helpers import not_support_multi_device, needs_second_gpu, slow
+from test.helpers import not_support_multi_device, needs_second_gpu, slow, assert_kernel_count, KernelCountException
 from hypothesis import given, strategies as strat, settings
 
 settings.register_profile("my_profile", max_examples=200, deadline=None, derandomize=getenv("DERANDOMIZE_CI", False))
@@ -143,9 +143,8 @@ class TestMultiTensor(unittest.TestCase):
     GlobalCounters.reset()
     with Context(ALLREDUCE_CAST=1, RING=0, ALL2ALL=0):
       tst.realize()
-    kernel_count = GlobalCounters.kernel_count
+    assert_kernel_count(kernel_count)
     np.testing.assert_allclose(tst.numpy(), (a_src.numpy()+b_src.numpy()).sum(0))
-    self.assertEqual(kernel_count, kernel_count)
 
   def test_allreduce_cast_half_assign(self): self.test_allreduce_cast_half(assign=True, kernel_count=10)
 
@@ -385,6 +384,18 @@ class TestMultiTensor(unittest.TestCase):
       np.testing.assert_allclose(r.numpy(), np.ones(256)+np.ones(256), atol=1e-4, rtol=1e-5)
     assert jf.captured is not None
 
+  def test_symbolic_broadcast_copy(self):
+    rows = Variable("rows", 1, 4).bind(3)
+    out = Tensor.ones(rows, 8).to(devices_2).realize()
+    self.assertEqual(out.shape, (rows, 8))
+    np.testing.assert_equal(out[:3].to(Device.DEFAULT).numpy(), np.ones((3, 8)))
+
+  def test_symbolic_broadcast_consumed(self):
+    rows = Variable("rows", 1, 4).bind(3)
+    out = (Tensor.ones(rows).to(devices_2) + 1).realize()
+    self.assertEqual(out.shape, (rows,))
+    np.testing.assert_equal(out[:3].to(Device.DEFAULT).numpy(), np.full(3, 2))
+
   def test_multitensor_jit_in_list(self):
     # test MULTI tensor inside a list container - exercises the container unpacking + MULTI unpacking
     @TinyJit
@@ -584,7 +595,7 @@ class TestMultiTensor(unittest.TestCase):
       zeros = Tensor.zeros(3).realize()
     b = a.to(devices_2)*zeros.to(devices_2)
     sched = b.schedule_linear().src
-    self.assertEqual(len(sched), 0)
+    if len(sched) != 0: raise KernelCountException(0, len(sched))
     self.assertListEqual(b.tolist(), [0, 0, 0])
 
 @unittest.skipIf(not_support_multi_device(), "no multi")
@@ -841,82 +852,6 @@ class TestMultiFromUnrenderable(unittest.TestCase):
     np.testing.assert_equal(ll.numpy(), np.arange(100)+1)
 
 @unittest.skipIf(not_support_multi_device(), "need multi")
-class TestMultiAssign(unittest.TestCase):
-  device = tuple(f"{Device.DEFAULT}:{i}" for i in range(2))
-
-  @needs_second_gpu
-  def setUp(self): pass
-
-  def test_multi_assign_realized(self):
-    out = Tensor.zeros(4).shard(self.device, 0).contiguous().realize()
-    ones = Tensor.ones(4).shard(self.device, 0).contiguous().realize()
-    out.assign(ones).realize()
-    self.assertListEqual(out.tolist(), [1,1,1,1])
-
-  def test_multi_assign_unrealized(self):
-    out = Tensor.zeros(4).contiguous().realize().shard(self.device, 0)
-    ones = Tensor.ones(4).shard(self.device, 0).contiguous().realize()
-    out.assign(ones).realize()
-    self.assertListEqual(out.tolist(), [1,1,1,1])
-
-  def test_multi_assign_both_unrealized(self):
-    out = Tensor.zeros(4).contiguous().realize().shard(self.device, 0)
-    ones = Tensor.ones(4).contiguous().realize().shard(self.device, 0)
-    out.assign(ones).realize()
-    self.assertListEqual(out.tolist(), [1,1,1,1])
-
-  def test_multi_assign_scalar(self):
-    out = Tensor.ones(4).shard(self.device, 0).contiguous().realize()
-    out.assign(0).realize()
-    self.assertListEqual(out.tolist(), [0,0,0,0])
-
-  def test_multi_assign_const_like(self):
-    out = Tensor.ones(4).shard(self.device, 0).contiguous().realize()
-    out.assign(out.const_like(7)).realize()
-    self.assertListEqual(out.tolist(), [7,7,7,7])
-
-  def test_multi_assign_piece(self):
-    out = Tensor.zeros(4,4).shard(self.device, 0).contiguous().realize()
-    ones = Tensor.ones(4,1).shard(self.device, 0).contiguous().realize()
-    out[:, 2:3].assign(ones).realize()
-    self.assertListEqual(out.tolist(), [[0,0,1,0], [0,0,1,0], [0,0,1,0], [0,0,1,0]])
-
-  def test_multi_assign_piece_noncontig(self):
-    out = Tensor.zeros(4,4).contiguous().realize().shard(self.device, 0).realize()
-    ones = Tensor.ones(4,1).shard(self.device, 0).contiguous().realize()
-    out[:, 2:3].assign(ones).realize()
-    self.assertListEqual(out.tolist(), [[0,0,1,0], [0,0,1,0], [0,0,1,0], [0,0,1,0]])
-
-  @unittest.expectedFailure
-  def test_multi_assign_piece_unrealized(self):
-    out = Tensor.zeros(4,4).contiguous().realize().shard(self.device, 0)
-    ones = Tensor.ones(4,1).shard(self.device, 0).contiguous().realize()
-    out[:, 2:3].assign(ones).realize()
-    self.assertListEqual(out.tolist(), [[0,0,1,0], [0,0,1,0], [0,0,1,0], [0,0,1,0]])
-
-  def test_multi_assign_var_offset(self):
-    out = Tensor.zeros(4,4).contiguous().realize().shard(self.device, 0).realize()
-    ones = Tensor.ones(4,1).shard(self.device, 0).contiguous().realize()
-    vi = Variable("i", 0, 3).bind(2)
-    out[:, vi:vi+1].assign(ones).realize()
-    self.assertListEqual(out.tolist(), [[0,0,1,0], [0,0,1,0], [0,0,1,0], [0,0,1,0]])
-
-  def test_multi_assign_var_offset_jit_none(self): self.test_multi_assign_var_offset_jit(None)
-  def test_multi_assign_var_offset_jit(self, shard_axis=0):
-    out = Tensor.zeros(4,6).contiguous().realize().shard(self.device, shard_axis).realize()
-    ones = Tensor.ones(4,1).shard(self.device, shard_axis).contiguous().realize()
-
-    @TinyJit
-    def f(out:Tensor, vi):
-      out[:, vi:vi+1].assign(ones).realize()
-      ones.assign(ones+1).realize()
-
-    vi = Variable("i", 0, 5)
-    for i in range(1,5):
-      GlobalCounters.reset()
-      f(out, vi.bind(i))
-    self.assertListEqual(out.tolist(), [[0,1,2,3,4,0]]*4)
-
 @unittest.skipIf(not_support_multi_device(), "need multi")
 class TestMultiSetitem(unittest.TestCase):
   device = tuple(f"{Device.DEFAULT}:{i}" for i in range(4))

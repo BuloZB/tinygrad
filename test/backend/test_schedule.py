@@ -6,33 +6,12 @@ import unittest, time
 import numpy as np
 
 from tinygrad import nn, dtypes, Device, Tensor, Variable
-from tinygrad.uop.ops import UOp, Ops, UPat
-from tinygrad.helpers import DEBUG, DEV, GlobalCounters, Context, all_same, temp
-from tinygrad.engine.realize import compile_linear, run_linear
+from tinygrad.uop.ops import Ops, UPat
+from tinygrad.helpers import DEV, GlobalCounters, Context, all_same, temp
+from tinygrad.engine.realize import run_linear
+from test.helpers import check_schedule, assert_kernel_count
 
 supported_dtypes = Device[Device.DEFAULT].renderer.supported_dtypes()
-
-class KernelCountException(Exception): pass
-def check_schedule(t:Tensor|list[Tensor]|UOp, allowed:int, to_prerealize:list[Tensor]|None=None, filter_sink=True):
-  if to_prerealize:
-    with Context(DEBUG=0, TRACK_MATCH_STATS=0): Tensor.realize(*to_prerealize)
-  if isinstance(t, Tensor): linear, var_vals = t.linear_with_vars()
-  elif isinstance(t, list) and isinstance(t[0], Tensor): linear, var_vals = Tensor.linear_with_vars(*t)
-  else:
-    assert isinstance(t, UOp), f"can't schedule {t}"
-    linear, var_vals = Tensor(t).linear_with_vars()
-  kernel_cnt = sum((len(call.device) if isinstance(call.device, tuple) else 1)
-                   for call in linear.src if call.src[0].op is Ops.SINK or not filter_sink)
-  if kernel_cnt != allowed:
-    print(f"SCHEDULE ISSUE, expecting {allowed} got {kernel_cnt}")
-    if DEBUG >= 3:
-      for i,call in enumerate(linear.src):
-        print("kernel", i+1)
-        print(call.src[0])
-    raise KernelCountException(f"{kernel_cnt} != {allowed}")
-  # test compiling the linear
-  compile_linear(linear)
-  return linear, var_vals
 
 def _realize_weights(m):
   for p in nn.state.get_parameters(m): p.realize()
@@ -113,11 +92,9 @@ class TestSchedule(unittest.TestCase):
     a2 = mop(a)
     expected = (a+a2).tolist()
     a.assign(a+a2)
-    linear, var_vals = a.linear_with_vars()
-    kcount = len(linear.src)
+    linear, var_vals = check_schedule(a, expected_kcount)
     run_linear(linear, var_vals)
     self.assertListEqual(a.tolist(), expected)
-    self.assertEqual(kcount, expected_kcount)
   def test_setitem_permuted_sched(self): self.test_setitem_sched(lambda x: x.T, 2)
   def test_setitem_paddded_sched(self): self.test_setitem_sched(lambda x: x.shrink_to(4, 1).pad_to(4, 4), 1)
 
@@ -126,9 +103,9 @@ class TestSchedule(unittest.TestCase):
     a = Tensor.arange(16).clone().realize()
     GlobalCounters.reset()
     a[4] = 3
-    self.assertEqual(GlobalCounters.kernel_count, 0)
+    assert_kernel_count(0)
     a.realize()
-    self.assertEqual(GlobalCounters.kernel_count, 1)
+    assert_kernel_count(1)
     self.assertListEqual(a.tolist(), [0, 1, 2, 3, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
 
   def test_no_extra_contiguous_on_setitem_assign_back(self):
@@ -170,7 +147,7 @@ class TestSchedule(unittest.TestCase):
     devs = ("CPU:0", "CPU:1")
     x = Tensor.ones(2, device="CPU").shard(devs, axis=0).realize()
     out = (x.sum()*2).reshape(1).to("CPU")
-    run_linear(*check_schedule(out, 5))
+    run_linear(*check_schedule(out, 3))
     np.testing.assert_equal(out.numpy(), [4.])
 
 class TestLimitBufs(unittest.TestCase):
@@ -199,7 +176,7 @@ class TestLimitBufs(unittest.TestCase):
 
   def test_limit_bufs_linear_scaling(self):
     def sched_time(n):
-      with Context(TRACK_MATCH_STATS=0, DEBUG=0):
+      with Context(TRACK_MATCH_STATS=0, DEBUG=0, PARALLEL=0):
         bufs = [Tensor.ones(16).contiguous().realize() for _ in range(4)]
         root = bufs[0]
         for i in range(n): root = root + bufs[i % 4]
@@ -388,16 +365,6 @@ class TestCopyFolding(unittest.TestCase):
     b = a.to("CPU")
     self.assertListEqual(b.tolist(), [2.])
 
-  def test_copy_to_same_device(self):
-    a = Tensor.empty(4).uop
-    b = a.copy_to_device(a.device)
-    check_schedule(b, 1, filter_sink=False) # TODO: 0?
-
-  def test_copy_to_same_device_alt(self):
-    a = Tensor.empty(4, 4).uop
-    b = a.copy_to_device(a.device)
-    check_schedule(b, 1, filter_sink=False) # TODO: 0?
-
   def test_copy_to_same_device_sched(self):
     a = Tensor.ones(4).contiguous().realize().uop.buf_uop
     t = Tensor(a.copy_to_device(a.device))
@@ -407,40 +374,35 @@ class TestCopyFolding(unittest.TestCase):
     assert t.uop.is_realized, f"didn't realize Tensor {t}"
     self.assertListEqual(t.tolist(), [1.,1.,1.,1.])
 
-  @unittest.skip("same-device copies are no-ops")
-  def test_self_assign_same_device_copy(self):
-    a = Tensor.ones(4, 4).contiguous().realize()
-    # use copy_to_device to bypass Tensor.to() shortcircuit and force a real same-device COPY in the graph
-    a.assign(Tensor(a.uop.copy_to_device(a.device), a.device))
-    run_linear(*check_schedule(a, 2, filter_sink=False))
-    self.assertListEqual(a.tolist(), [[1.]*4]*4)
-
   def test_clone(self):
     a = Tensor.empty(4)
     check_schedule(a.clone(), 1, filter_sink=False)
 
   def test_shrink_copy(self):
-    a = Tensor.arange(4)
-    view = a.shrink(((0, 2),))
-    b = view.clone()
-    run_linear(*check_schedule(b, 1, filter_sink=False))
-    self.assertEqual(b.uop.base.buffer.size, 2)
-    self.assertEqual(b.uop.numel(), 2)
-    self.assertListEqual(b.tolist(), [0, 1])
+    a = Tensor.arange(4).clone("CPU:1").realize()
+    b = a.to("CPU:2").shrink(((1, 3),)).to("CPU:3")
+    GlobalCounters.reset()
+    run_linear(*check_schedule(b, 3, filter_sink=False))
+    # extra E kernel, copy exactly 4 bytes
+    self.assertEqual(GlobalCounters.global_mem, 4*4 + 2*4*2 + 2*4)
+    self.assertListEqual(b.tolist(), [1, 2])
 
   def test_expanded_copy(self):
-    a = Tensor.arange(2)
-    view = a.reshape(2, 1).expand(2, 2)
-    b = view.clone()
-    run_linear(*check_schedule(b, 1, filter_sink=False))
-    self.assertEqual(b.uop.base.buffer.size, 4)
-    self.assertEqual(b.uop.numel(), 4)
-    self.assertListEqual(b.tolist(), [[0, 0], [1, 1]])
+    a = Tensor.arange(4).clone("CPU:1").realize()
+    b = a.to("CPU:2").reshape(4, 1).expand(4, 2).to("CPU:3")
+    GlobalCounters.reset()
+    run_linear(*check_schedule(b, 3, filter_sink=False))
+    # TODO: expands before copy
+    self.assertEqual(GlobalCounters.global_mem, 4*4 + (4*4 + 8*4) + 8*4)
+    self.assertListEqual(b.tolist(), [[0, 0], [1, 1], [2, 2], [3, 3]])
 
   def test_permuted_copy(self):
-    a = Tensor.arange(4)
-    b = a.reshape(2, 2).permute(1, 0)
-    b.realize()
+    a = Tensor.arange(4).clone("CPU:1").realize()
+    b = a.to("CPU:2").reshape(2, 2).permute(1, 0).to("CPU:3")
+    GlobalCounters.reset()
+    run_linear(*check_schedule(b, 3, filter_sink=False))
+    # permutes before copy
+    self.assertEqual(GlobalCounters.global_mem, 4*4 + (4*4 + 4*4) + 4*4)
     self.assertListEqual(b.tolist(), [[0, 2], [1, 3]])
 
   def test_permute_on_disk(self):

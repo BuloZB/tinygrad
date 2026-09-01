@@ -47,17 +47,17 @@ def fast_idiv(ren: Renderer, x: UOp, d: int, dont_cast=False) -> UOp|None:
 
 def threefry2x32(x: UOp, key: UOp):
   # split x and key from uint64 to two uint32
-  x0, x1 = (x & 0xffffffff).cast(dtypes.uint32), ((x // 2**32) & 0xffffffff).cast(dtypes.uint32)
-  key0, key1 = (key & 0xffffffff).cast(dtypes.uint32), ((key // 2**32) & 0xffffffff).cast(dtypes.uint32)
+  x0, x1 = x.cast(dtypes.uint32), (x >> 32).cast(dtypes.uint32)
+  key0, key1 = key.cast(dtypes.uint32), (key >> 32).cast(dtypes.uint32)
 
   rotations = [[13, 15, 26, 6], [17, 29, 16, 24]]
   ks = [key1, key0 ^ key1 ^ 0x1BD11BDA, key0]
   xr:list[UOp] = [x0 + ks[-1], x1 + ks[0]]
   for i in range(5):
-    for r in rotations[i % 2]: xr[0], xr[1] = (x0 := xr[0] + xr[1]), x0 ^ ((xr[1] * 2**r) + (xr[1] // 2**(32 - r)))
+    for r in rotations[i % 2]: xr[0], xr[1] = (x0 := xr[0] + xr[1]), x0 ^ ((xr[1] << r) + (xr[1] >> (32 - r)))
     xr = [(xr[0] + ks[i % 3]), (xr[1] + ks[(i + 1) % 3] + i + 1)]
 
-  return xr[1].cast(dtypes.uint64) * 2**32 | xr[0].cast(dtypes.uint64)
+  return (xr[1].cast(dtypes.uint64) << 32) | xr[0].cast(dtypes.uint64)
 
 # ***** decomposition patterns *****
 
@@ -75,12 +75,16 @@ powers_of_two: dict[int, int] = {2**i:i for i in range(64)}
 @functools.cache
 def get_simplifying_rewrite_patterns(ops:tuple[Ops, ...]) -> PatternMatcher:
   # these are rewrites that make things simpler
-  pat: list[tuple[UPat, Callable]] = [(UPat.var("a")//UPat.var("b"), floordiv_to_idiv)]
+  pat: list[tuple[UPat, Callable]] = []
+  # FLOORDIV by 2**y -> x >> y (an arithmetic shift is exactly floor division for any sign); fires before floordiv_to_idiv
+  if Ops.SHR in ops: pat.append((UPat.var("x", dtypes.ints)//UPat.cvar("c"),
+    lambda x,c: x >> v if (v:=powers_of_two.get(c.val, 0)) else None))
+  pat.append((UPat.var("a")//UPat.var("b"), floordiv_to_idiv))
   # FLOORMOD by 2**y -> x & (2**y-1) (correct floor mod for any sign in two's complement); fires before floormod_to_mod
   if Ops.AND in ops: pat.append((UPat.var("x", dtypes.ints)%UPat.cvar("c"), lambda x,c: x & (c.val-1) if c.val in powers_of_two else None))
   pat.append((UPat.var("a")%UPat.var("b"), floormod_to_mod))
   # no real hardware supports THREEFRY, but NullRenderer does
-  if Ops.THREEFRY not in ops: pat.append((UPat(Ops.THREEFRY, dtype=dtypes.uint64, src=(UPat.var("x"), UPat.var("key"))), threefry2x32))
+  if Ops.THREEFRY not in ops: pat.append((UPat(Ops.THREEFRY, src=(UPat.var("x"), UPat.var("key"))), threefry2x32))
   # MAX can be rewritten as CMPLT + WHERE (max function is annoying on many cstyle backends)
   if Ops.MAX not in ops and Ops.CMPLT in ops: pat.append((UPat(Ops.MAX, name="m"), lambda m: (m.src[0] < m.src[1]).where(m.src[1], m.src[0])))
   return PatternMatcher(pat)
@@ -128,6 +132,6 @@ def get_late_rewrite_patterns(ops:tuple[Ops, ...], disable_fast_idiv:bool) -> Pa
     if Ops.SHL in ops: pat += [(UPat.var('x').alu(Ops.SHL, UPat.cvar('n'))+UPat.var('c'), lambda x,n,c: x.alu(Ops.MULACC, x.const_like(1<<n.val), c))]
   # some backends emit FDIV for RECIP, in that case: a*(1/b) -> a/b
   if Ops.FDIV in ops:
-    pat += [(UPat.var("x").reciprocal(), lambda x: x.const_like(1).alu(Ops.FDIV, x))]
-    pat += [(UPat.var("a", dtypes.floats) * UPat(Ops.FDIV, dtypes.floats, src=(UPat.const(1), UPat.var("b"))), lambda a,b: a.alu(Ops.FDIV, b))]
+    pat += [(UPat.var("x").reciprocal(), lambda x: UOp.const(1.0).alu(Ops.FDIV, x))]
+    pat += [(UPat.var("a") * UPat(Ops.FDIV, dtypes.floats, src=(UPat.const(1), UPat.var("b"))), lambda a,b: a.alu(Ops.FDIV, b))]
   return PatternMatcher(pat)

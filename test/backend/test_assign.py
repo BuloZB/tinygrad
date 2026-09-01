@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 import unittest
 import numpy as np
-from tinygrad import dtypes, Tensor, TinyJit, GlobalCounters, Variable
+from tinygrad import Device, dtypes, Tensor, TinyJit, GlobalCounters, Variable
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.helpers import temp, DEV, Context
+from test.helpers import assert_kernel_count, needs_second_gpu
 
 N = 200  # has to be bigger than the cache to fail
 
@@ -42,7 +43,7 @@ class TestAssign(unittest.TestCase):
     # it should copy into the empty buffer
     GlobalCounters.reset()
     c.realize()
-    self.assertEqual(GlobalCounters.kernel_count, 1)
+    assert_kernel_count(1)
 
   def test_assign_slice(self):
     X = Tensor([1,2,3,4]).realize()
@@ -50,7 +51,7 @@ class TestAssign(unittest.TestCase):
     xs.assign(xs+1)
     GlobalCounters.reset()
     self.assertListEqual(X.tolist(), [1,2,4,5])
-    self.assertEqual(GlobalCounters.kernel_count, 1)
+    assert_kernel_count(1)
 
   def test_assign_slice_alt(self):
     X = Tensor([1,2,3,4]).realize()
@@ -58,7 +59,7 @@ class TestAssign(unittest.TestCase):
     xs1.assign(xs2+1)
     GlobalCounters.reset()
     self.assertListEqual(X.tolist(), [1,4,5,4])
-    self.assertEqual(GlobalCounters.kernel_count, 2)
+    assert_kernel_count(2)
 
   def test_assign_flip(self):
     ref = np.arange(16, dtype=np.float32)
@@ -68,7 +69,7 @@ class TestAssign(unittest.TestCase):
     xs.assign(xs + X)
     ref = ref + ref[::-1]
     np.testing.assert_allclose(X.numpy(), ref)
-    self.assertEqual(GlobalCounters.kernel_count, 2)
+    assert_kernel_count(2)
 
   def test_assign_add(self):
     for T in (1, 2, 10):#, 100): # this crashes in CI, not sure why
@@ -331,14 +332,14 @@ class TestAssign(unittest.TestCase):
     a = (Tensor.arange(16).reshape(4,4).clone().realize() + 1)
     GlobalCounters.reset()
     b.assign(a.contiguous()).realize()
-    self.assertEqual(GlobalCounters.kernel_count, 2)
+    assert_kernel_count(2)
 
   def test_assign_contiguous_permute(self):
     b = Tensor.arange(16).reshape(4,4).clone().realize()
     a = (Tensor.arange(16).reshape(4,4).clone().realize() + 1).permute((1,0))
     GlobalCounters.reset()
     b.assign(a.contiguous()).realize()
-    self.assertEqual(GlobalCounters.kernel_count, 2)
+    assert_kernel_count(2)
 
   def test_permuted_assignment(self):
     a = Tensor(np.arange(N*N, dtype=np.float32)).reshape(N,N)
@@ -413,7 +414,7 @@ class TestAssign(unittest.TestCase):
 
     GlobalCounters.reset()
     Tensor.realize(b, c, d)
-    self.assertEqual(GlobalCounters.kernel_count, 1)
+    assert_kernel_count(1)
     np.testing.assert_allclose(b.numpy(), a.sum(1).numpy()+1)
     np.testing.assert_allclose(c.numpy(), a.sum(1).numpy()+2)
     np.testing.assert_allclose(d.numpy(), a.sum(1).numpy()+3)
@@ -461,7 +462,7 @@ class TestAssign(unittest.TestCase):
     b.assign(r + b)
     c.assign(r + b_perm.contiguous())
     Tensor.realize(b, c)
-    self.assertEqual(GlobalCounters.kernel_count, 2)
+    assert_kernel_count(2)
     np.testing.assert_equal(b.numpy(), a.numpy().sum(1) + np.arange(32 * 32).reshape(32, 32))
     np.testing.assert_equal(c.numpy(), a.numpy().sum(1) + np.arange(32 * 32).reshape(32, 32).transpose(1, 0))
 
@@ -471,7 +472,7 @@ class TestAssign(unittest.TestCase):
     a.assign(a + b)
     GlobalCounters.reset()
     a.realize()
-    self.assertEqual(GlobalCounters.kernel_count, 1)
+    assert_kernel_count(1)
     np.testing.assert_equal(a.numpy(), np.ones((4, 4))+np.pad(np.ones((4, 4))[:, 0:2], ((0, 0), (0, 2)), constant_values=2))
 
   def test_permuted_assignment_masked_view_not_contiguous(self):
@@ -510,7 +511,7 @@ class TestAssign(unittest.TestCase):
     expected[0:10] = expected[50:60].copy()
     GlobalCounters.reset()
     a[0:10].assign(a[50:60]).realize()
-    self.assertEqual(GlobalCounters.kernel_count, 2)  # currently conservative, forces contiguous
+    assert_kernel_count(2)  # currently conservative, forces contiguous
     np.testing.assert_allclose(a.numpy(), expected)
 
   def test_setitem_half(self):
@@ -539,6 +540,10 @@ class TestAssign(unittest.TestCase):
     c = Tensor([1.0, 2.0, 3.0, 4.0], dtype=dtypes.float32).realize()
     c[0:2].bitcast(dtypes.uint32).assign(Tensor([0x40800000, 0x40400000], dtype=dtypes.uint32)).realize()
     np.testing.assert_allclose(c.numpy(), [4.0, 3.0, 3.0, 4.0])
+    # without .realize()
+    a = Tensor([1.0, 2.0, 3.0, 4.0], dtype=dtypes.float32).realize()
+    a.bitcast(dtypes.uint32).assign(Tensor([0x40800000, 0x40400000, 0x40000000, 0x3f800000], dtype=dtypes.uint32))
+    np.testing.assert_allclose(a.numpy(), [4.0, 3.0, 2.0, 1.0])
 
   def test_assign_bitcast_different_size(self):
     # assign to a shape-changing bitcast view (only works on DISK currently)
@@ -630,7 +635,7 @@ class TestAssign(unittest.TestCase):
     GlobalCounters.reset()
     x.realize()
     # N assigns (1 kernel each) producing N kernels total
-    self.assertEqual(GlobalCounters.kernel_count, N)
+    assert_kernel_count(N)
 
   def test_shared_computation_assign_kernel_count(self):
     """When a .contiguous() is shared between an assign value and the next layer's input (like QKV projection in LLM),
@@ -648,7 +653,7 @@ class TestAssign(unittest.TestCase):
     GlobalCounters.reset()
     caches[-1][:1].contiguous().realize()
     # N matmuls + N assigns + 1 final read = 2*N+1 (AFTER embedding allows full graph scheduling with shared contiguous reuse)
-    self.assertEqual(GlobalCounters.kernel_count, 2*N+1)
+    assert_kernel_count(2*N+1)
 
   def test_double_assign_from_const(self):
     a = Tensor.empty(2)
@@ -656,7 +661,7 @@ class TestAssign(unittest.TestCase):
     a.assign(Tensor.ones(2, buffer=False))
     GlobalCounters.reset()
     a.realize()
-    self.assertEqual(GlobalCounters.kernel_count, 1)
+    assert_kernel_count(1)
     self.assertEqual(a.tolist(), [1.,1.])
 
   def test_assign_deviceless_const(self):
@@ -672,7 +677,7 @@ class TestAssign(unittest.TestCase):
     contig.assign(Tensor([1, 4, 3], dtype=dtypes.int64))
     GlobalCounters.reset()
     base.assign(contig).realize()
-    self.assertEqual(GlobalCounters.kernel_count, 2)  # TODO: first copy is dead, could be 1
+    assert_kernel_count(2)  # TODO: first copy is dead, could be 1
     self.assertEqual(base.tolist(), [1,4,3])
 
   def test_nested_after_contiguous_store_no_init(self):
@@ -682,7 +687,7 @@ class TestAssign(unittest.TestCase):
     contig.assign(Tensor([1, 4, 3], dtype=dtypes.int64))
     GlobalCounters.reset()
     base.assign(contig).realize()
-    self.assertEqual(GlobalCounters.kernel_count, 1)
+    assert_kernel_count(1)
     self.assertEqual(base.tolist(), [1,4,3])
 
 class TestAssignOrdering(unittest.TestCase):
@@ -1074,5 +1079,80 @@ class TestBatchNormRunningStats(unittest.TestCase):
     with Context(TRAINING=1): bn(x).realize()
     self.assertTrue(bn.running_mean.uop.base.is_realized)
 
+class TestMultiAssign(unittest.TestCase):
+  device = tuple(f"{Device.DEFAULT}:{i}" for i in range(2))
+
+  @needs_second_gpu
+  def setUp(self): pass
+
+  def test_multi_assign_realized(self):
+    out = Tensor.zeros(4).shard(self.device, 0).contiguous().realize()
+    ones = Tensor.ones(4).shard(self.device, 0).contiguous().realize()
+    out.assign(ones).realize()
+    self.assertListEqual(out.tolist(), [1,1,1,1])
+
+  def test_multi_assign_unrealized(self):
+    out = Tensor.zeros(4).contiguous().realize().shard(self.device, 0)
+    ones = Tensor.ones(4).shard(self.device, 0).contiguous().realize()
+    out.assign(ones).realize()
+    self.assertListEqual(out.tolist(), [1,1,1,1])
+
+  def test_multi_assign_both_unrealized(self):
+    out = Tensor.zeros(4).contiguous().realize().shard(self.device, 0)
+    ones = Tensor.ones(4).contiguous().realize().shard(self.device, 0)
+    out.assign(ones).realize()
+    self.assertListEqual(out.tolist(), [1,1,1,1])
+
+  def test_multi_assign_scalar(self):
+    out = Tensor.ones(4).shard(self.device, 0).contiguous().realize()
+    out.assign(0).realize()
+    self.assertListEqual(out.tolist(), [0,0,0,0])
+
+  def test_multi_assign_const_like(self):
+    out = Tensor.ones(4).shard(self.device, 0).contiguous().realize()
+    out.assign(out.const_like(7)).realize()
+    self.assertListEqual(out.tolist(), [7,7,7,7])
+
+  def test_multi_assign_piece(self):
+    out = Tensor.zeros(4,4).shard(self.device, 0).contiguous().realize()
+    ones = Tensor.ones(4,1).shard(self.device, 0).contiguous().realize()
+    out[:, 2:3].assign(ones).realize()
+    self.assertListEqual(out.tolist(), [[0,0,1,0], [0,0,1,0], [0,0,1,0], [0,0,1,0]])
+
+  def test_multi_assign_piece_noncontig(self):
+    out = Tensor.zeros(4,4).contiguous().realize().shard(self.device, 0).realize()
+    ones = Tensor.ones(4,1).shard(self.device, 0).contiguous().realize()
+    out[:, 2:3].assign(ones).realize()
+    self.assertListEqual(out.tolist(), [[0,0,1,0], [0,0,1,0], [0,0,1,0], [0,0,1,0]])
+
+  @unittest.expectedFailure
+  def test_multi_assign_piece_unrealized(self):
+    out = Tensor.zeros(4,4).contiguous().realize().shard(self.device, 0)
+    ones = Tensor.ones(4,1).shard(self.device, 0).contiguous().realize()
+    out[:, 2:3].assign(ones).realize()
+    self.assertListEqual(out.tolist(), [[0,0,1,0], [0,0,1,0], [0,0,1,0], [0,0,1,0]])
+
+  def test_multi_assign_var_offset(self):
+    out = Tensor.zeros(4,4).contiguous().realize().shard(self.device, 0).realize()
+    ones = Tensor.ones(4,1).shard(self.device, 0).contiguous().realize()
+    vi = Variable("i", 0, 3).bind(2)
+    out[:, vi:vi+1].assign(ones).realize()
+    self.assertListEqual(out.tolist(), [[0,0,1,0], [0,0,1,0], [0,0,1,0], [0,0,1,0]])
+
+  def test_multi_assign_var_offset_jit_none(self): self.test_multi_assign_var_offset_jit(None)
+  def test_multi_assign_var_offset_jit(self, shard_axis=0):
+    out = Tensor.zeros(4,6).contiguous().realize().shard(self.device, shard_axis).realize()
+    ones = Tensor.ones(4,1).shard(self.device, shard_axis).contiguous().realize()
+
+    @TinyJit
+    def f(out:Tensor, vi):
+      out[:, vi:vi+1].assign(ones).realize()
+      ones.assign(ones+1).realize()
+
+    vi = Variable("i", 0, 5)
+    for i in range(1,5):
+      GlobalCounters.reset()
+      f(out, vi.bind(i))
+    self.assertListEqual(out.tolist(), [[0,1,2,3,4,0]]*4)
 if __name__ == "__main__":
   unittest.main()

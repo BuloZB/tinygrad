@@ -169,6 +169,13 @@ class TestFp8sConversions(unittest.TestCase):
   def test_fp8e5m2fnuz_to_float(self, x):
     np.testing.assert_equal(fp8_to_float(x, dtypes.fp8e5m2fnuz), torch.tensor(x, dtype=torch.uint8).view(torch.float8_e5m2fnuz).float().item())
 
+  def test_fp8e5m2fnuz_to_float_smallest_normals(self):
+    # fnuz bias exceeds half's, so exp-1 normals land below half's normal range: they flush to zero like denormals
+    if dtypes.half not in supported_dtypes or dtypes.half in EMULATED_DTYPES.tolist(dtypes) or dtypes.fp8e5m2fnuz in supported_dtypes:
+      self.skipTest("needs the emulated fp8 with a native half intermediate")
+    vals = Tensor([0x04, 0x05, 0x06, 0x07], dtype=dtypes.uint8).bitcast(dtypes.fp8e5m2fnuz).float().numpy()
+    np.testing.assert_equal(vals, [0., 0., 0., 0.])
+
 class TestBFloat16DType(unittest.TestCase):
   def test_bf16_to_float(self):
     _test_cast(Tensor([100000], dtype=dtypes.bfloat16), dtypes.float32)
@@ -251,6 +258,11 @@ class TestDoubleDType(TestDType):
       a = [2, 3, 4]
       np.testing.assert_allclose(func(Tensor(a, dtype=self.DTYPE)).numpy(), func(torch.tensor(a, dtype=torch.float64)), rtol=1e-12, atol=1e-12)
 
+  def test_float32_compare_selecting_float64(self):
+    a = Tensor([1.0, 2.0, 5.0, 9.0], dtype=dtypes.float32)
+    p, q = Tensor([10., 20., 30., 40.], dtype=self.DTYPE), Tensor([50., 60., 70., 80.], dtype=self.DTYPE)
+    _test_op(lambda: (a < 3.0).where(p, q), self.DTYPE, [10., 20., 70., 80.])
+
   def test_float64_to_float32_cast_inf(self):
     _test_op(lambda: Tensor([3.4e40, 3.4e38, 1, 0], dtype=dtypes.float64).cast(dtypes.float32),
              dtypes.float32, [float('inf'), 3.4e38, 1, 0])
@@ -316,7 +328,10 @@ class TestUint16DType(TestDType):
 class TestInt32DType(TestDType): DTYPE = dtypes.int32
 class TestUint32DType(TestDType): DTYPE = dtypes.uint32
 
-class TestInt64DType(TestDType): DTYPE = dtypes.int64
+class TestInt64DType(TestDType):
+  DTYPE = dtypes.int64
+  def test_int64_to_uint32_to_int64(self):
+    _test_op(lambda: Tensor([0x12345678ABCDEF01], dtype=dtypes.int64).cast(dtypes.uint32).cast(dtypes.int64), dtypes.int64, [2882400001])
 
 @unittest.skipIf(isinstance(Device[Device.DEFAULT].renderer, PTXRenderer), "PTX does indexing math with longs")
 class TestEmulatedInt64DType(TestInt64DType):
@@ -333,6 +348,9 @@ class TestUint64DType(TestDType):
   DTYPE = dtypes.uint64
   def test_uint64_load(self):
     assert Tensor(2**64 - 1, dtype=dtypes.uint64).numpy() == 2**64 - 1
+  @unittest.skipIf(dtypes.double not in supported_dtypes, "needs float64")
+  def test_uint64_cast_double(self):
+    assert Tensor([2**32 + 1], dtype=dtypes.uint64).cast(dtypes.double).numpy() == 2**32 + 1
 
 @unittest.skipIf(isinstance(Device[Device.DEFAULT].renderer, PTXRenderer), "PTX does indexing math with longs")
 class TestEmulatedUInt64DType(TestUint64DType):
@@ -412,6 +430,11 @@ class TestDtypeUsage(unittest.TestCase):
       if d in supported_dtypes:
         t = Tensor([[1, 2], [3, 4]], dtype=d)
         (t*t).max().item()
+
+  def test_where_float16_compare_to_const(self):
+    # t > 0 is CMPLT(0, t): the float16 operand is on the right
+    t = Tensor([-1.0, 1.0], dtype=dtypes.float16)
+    np.testing.assert_equal((t > 0).where(Tensor.ones(2, dtype=dtypes.float16), Tensor.zeros(2, dtype=dtypes.float16)).numpy(), [0.0, 1.0])
 
 @unittest.skipUnless(dtypes.bfloat16 in supported_dtypes, f"no bfloat16 on {Device.DEFAULT}")
 class TestOpsBFloat16(unittest.TestCase):
